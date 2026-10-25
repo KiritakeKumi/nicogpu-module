@@ -43,8 +43,8 @@
 #define NICOGPU_C3_WIN_SIZE	(1ULL << NICOGPU_C3_WIN_LOG2)
 #define NICOGPU_C3_PT_OFF		SZ_16M			/* [0, 16 MiB) reserved: ring, firmware */
 #define NICOGPU_C3_PT_END		SZ_256M			/* page-table pool end */
-#define NICOGPU_GTT_BO_MAX		SZ_256M			/* one contiguous IOVA range */
-#define NICOGPU_GTT_TOTAL_MAX	SZ_1G
+#define NICOGPU_GTT_BO_MAX		SZ_1G			/* one contiguous IOVA range; needs a CMA pool this big (cma=2G) */
+#define NICOGPU_GTT_TOTAL_MAX	(2ULL * SZ_1G)
 #define NICOGPU_INVAL_TIMEOUT_MS	100
 
 /* Every open file of every device; torn-down files are marked, never touch
