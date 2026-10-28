@@ -20,7 +20,7 @@
 #define ROOT_LEVEL	(XVC_LEVELS - 1)
 
 /* ------------------------------------------------------------------------ */
-/* BO arguments: same checks and order as SimDevice::bo_create.             */
+/* BO arguments: same checks and order as SimDevice::bo_create. */
 
 int xvc_bo_args_check(uint64_t size, uint64_t alignment, uint32_t domain, uint32_t flags,
 		      uint64_t *out_size, uint64_t *out_align)
@@ -45,7 +45,7 @@ int xvc_bo_args_check(uint64_t size, uint64_t alignment, uint32_t domain, uint32
 }
 
 /* ------------------------------------------------------------------------ */
-/* Bitmap page pool.                                                        */
+/* Bitmap page pool. */
 
 size_t xvc_pool_words(uint64_t npages)
 {
@@ -118,7 +118,7 @@ void xvc_pool_free(struct xvc_pool *p, uint64_t addr, uint64_t size)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Entry decoding (pte.h decode_entry, rules D1..D15 in order).             */
+/* Entry decoding (pte.h decode_entry, rules D1..D15 in order). */
 
 static bool table_pa_ok(uint64_t pa)
 {
@@ -213,7 +213,7 @@ struct xvc_decoded xvc_decode(uint64_t e, unsigned int level)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Shadow page tables and the transaction journal.                          */
+/* Shadow page tables and the transaction journal. */
 
 struct xvc_pt {
 	uint64_t e[XVC_ENTRIES];	/* shadow of the device table */
@@ -611,6 +611,7 @@ size_t xvc_pt_reclaim(struct xvc_vm *vm)
 	return n;
 }
 
+#ifndef __KERNEL__	/* host tests only */
 size_t xvc_pt_retired(const struct xvc_vm *vm)
 {
 	const struct xvc_pt *t;
@@ -620,9 +621,10 @@ size_t xvc_pt_retired(const struct xvc_vm *vm)
 		n++;
 	return n;
 }
+#endif /* !__KERNEL__ */
 
 /* ------------------------------------------------------------------------ */
-/* VM lifetime, lookup, verify, digest.                                     */
+/* VM lifetime, lookup, verify, digest. */
 
 int xvc_vm_init(struct xvc_vm *vm, const struct xvc_ops *ops, void *ctx)
 {
@@ -659,6 +661,7 @@ void xvc_vm_fini(struct xvc_vm *vm)
 		vm->ops->free(vm->ctx, vm->maps);
 	vm->maps = NULL;
 	vm->nmaps = 0;
+	vm->maps_cap = 0;
 }
 
 uint64_t xvc_vm_root_pa(const struct xvc_vm *vm)
@@ -698,6 +701,7 @@ void xvc_vm_lookup(const struct xvc_vm *vm, uint64_t va, struct xvc_xlate *out)
 	}
 }
 
+#ifndef __KERNEL__	/* host tests only */
 static const char *verify_table(const struct xvc_pt *t, unsigned int level, size_t *count)
 {
 	unsigned int i, j;
@@ -789,21 +793,34 @@ uint64_t xvc_vm_digest(const struct xvc_vm *vm, uint64_t h)
 {
 	return vm->root ? digest_walk(vm->root, ROOT_LEVEL, h) : h;
 }
+#endif /* !__KERNEL__ */
 
 /* ------------------------------------------------------------------------ */
-/* VM_BIND.                                                                 */
+/* VM_BIND. */
 
-/* Remove [va, va+size) from the sorted mapping array, splitting partial
- * overlaps (model carve()).  The array has room for one more record.
- * Returns the index where a record starting at va belongs. */
-static uint32_t carve(struct xvc_map *m, uint32_t *pn, uint64_t va, uint64_t size)
+/*
+ * A VM_BIND call works on a staged copy of the *window* of the mapping table only: the records that overlap
+ * [L, H), the union of the op ranges (validated, no overflow).  Every op carves and inserts inside [L, H), so the
+ * records before the window (end <= L) and after it (va >= H) are never touched, and on success the table becomes
+ *   maps[0, a) ++ staged ++ maps[b, nmaps)
+ * (one memmove of the tail, or a copy into a larger array allocated before the commit).  BO references follow the
+ * records exactly: a record created by this call (inserted, or the right half of a record split in two) carries
+ * MAP_NEW in `kind` while staged and takes its reference at commit; a window record that existed before the call and
+ * disappears entirely is noted in `drop` and gives its reference back after the TLB invalidation; truncated records
+ * keep theirs.  Nothing is referenced or released before the commit, so a failure only frees the staging memory.
+ */
+#define MAP_NEW		0x80000000u	/* staging only: created by this call, no BO reference yet */
+
+struct stage {
+	struct xvc_map *m;	/* window copy, room for (b - a) + 2n records */
+	uint32_t n;
+	void **drop;		/* BOs of pre-existing records removed by this call */
+	uint32_t ndrop;
+};
+
+/* first record of m[lo, hi) that ends after va (records are sorted and disjoint) */
+static uint32_t first_ending_after(const struct xvc_map *m, uint32_t lo, uint32_t hi, uint64_t va)
 {
-	uint64_t end = va + size;
-	uint32_t n = *pn, lo = 0, hi = n, keep;
-	struct xvc_map l, r;
-	bool keep_l, keep_r;
-
-	/* first record ending after va (records are sorted and disjoint) */
 	while (lo < hi) {
 		uint32_t mid = lo + (hi - lo) / 2;
 
@@ -812,6 +829,35 @@ static uint32_t carve(struct xvc_map *m, uint32_t *pn, uint64_t va, uint64_t siz
 		else
 			lo = mid + 1;
 	}
+	return lo;
+}
+
+/* first record of m[lo, hi) that starts at or after va */
+static uint32_t first_starting_at(const struct xvc_map *m, uint32_t lo, uint32_t hi, uint64_t va)
+{
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+
+		if (m[mid].va >= va)
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+	return lo;
+}
+
+/* Remove [va, va+size) from the staged records, splitting partial overlaps
+ * (model carve()).  The array has room for one more record.  Returns the
+ * index where a record starting at va belongs. */
+static uint32_t carve(struct stage *s, uint64_t va, uint64_t size)
+{
+	struct xvc_map *m = s->m;
+	uint64_t end = va + size;
+	uint32_t n = s->n, lo, hi, keep, i;
+	struct xvc_map l, r;
+	bool keep_l, keep_r;
+
+	lo = first_ending_after(m, 0, n, va);
 	for (hi = lo; hi < n && m[hi].va < end; hi++)
 		;
 	if (lo == hi)
@@ -821,6 +867,10 @@ static uint32_t carve(struct xvc_map *m, uint32_t *pn, uint64_t va, uint64_t siz
 	keep_l = l.va < va;
 	keep_r = r.va + r.size > end;
 	keep = (uint32_t)keep_l + (uint32_t)keep_r;
+	/* every record of [lo, hi) but a truncated first / last one disappears */
+	for (i = lo + keep_l; i + keep_r < hi; i++)
+		if (m[i].bo && !(m[i].kind & MAP_NEW))
+			s->drop[s->ndrop++] = m[i].bo;
 	memmove(&m[lo + keep], &m[hi], (size_t)(n - hi) * sizeof(*m));
 	if (keep_l) {
 		l.size = va - l.va;
@@ -832,17 +882,29 @@ static uint32_t carve(struct xvc_map *m, uint32_t *pn, uint64_t va, uint64_t siz
 		r.va = end;
 		r.size -= cut;
 		r.bo_offset += cut;
+		if (keep_l && lo + 1 == hi)
+			r.kind |= MAP_NEW;	/* one record split in two: the right half is a new reference */
 		m[lo + keep_l] = r;
 	}
-	*pn = n - (hi - lo) + keep;
+	s->n = n - (hi - lo) + keep;
 	return lo + keep_l;
 }
 
-static void insert_at(struct xvc_map *m, uint32_t *pn, uint32_t at, const struct xvc_map *rec)
+static void insert_at(struct stage *s, uint32_t at, const struct xvc_map *rec)
 {
-	memmove(&m[at + 1], &m[at], (size_t)(*pn - at) * sizeof(*m));
-	m[at] = *rec;
-	(*pn)++;
+	memmove(&s->m[at + 1], &s->m[at], (size_t)(s->n - at) * sizeof(*s->m));
+	s->m[at] = *rec;
+	s->n++;
+}
+
+/* capacity for a table of n records: some headroom so a run of growing binds does not reallocate every time */
+static uint32_t maps_cap_for(const struct xvc_vm *vm, uint32_t n)
+{
+	uint64_t cap = (uint64_t)n + n / 4 + 16;
+
+	if (cap > vm->max_maps)
+		cap = vm->max_maps > n ? vm->max_maps : n;
+	return (uint32_t)cap;
 }
 
 /* Validate the whole array first (SimDevice::vm_bind order) so a bad op
@@ -890,11 +952,28 @@ static void finish(struct xvc_vm *vm)
 		xvc_pt_reclaim(vm);
 }
 
+/* maps[0, a) ++ s->m[0, s->n) ++ maps[b, nmaps) -> `to` (room for the result; may be vm->maps itself) */
+static void splice(struct xvc_vm *vm, struct xvc_map *to, uint32_t a, uint32_t b, const struct stage *s)
+{
+	struct xvc_map *from = vm->maps;
+	uint32_t tail = vm->nmaps - b;
+
+	if (to != from && a)
+		memcpy(to, from, (size_t)a * sizeof(*to));
+	if (tail && (to != from || s->n != b - a))
+		memmove(&to[a + s->n], &from[b], (size_t)tail * sizeof(*to));
+	if (s->n)
+		memcpy(&to[a], s->m, (size_t)s->n * sizeof(*to));
+}
+
 int xvc_vm_bind(struct xvc_vm *vm, const struct xvc_bind_op *ops, uint32_t n)
 {
-	struct xvc_bo_info *bos = NULL;
-	struct xvc_map *staged = NULL;
-	uint32_t i, ns, cap;
+	struct xvc_bo_info *bos;
+	struct xvc_map *grown = NULL;
+	struct stage s;
+	uint64_t lo_va, hi_va;
+	uint32_t i, a, b, win, cap = 0, new_n;
+	void *blk;
 	int rc;
 
 	if (n > XVC_MAX_BIND_OPS)
@@ -903,73 +982,123 @@ int xvc_vm_bind(struct xvc_vm *vm, const struct xvc_bind_op *ops, uint32_t n)
 	if (rc || n == 0)
 		return rc;
 
+	/* the window: records overlapping the union [lo_va, hi_va) of the op ranges */
+	lo_va = ops[0].va;
+	hi_va = ops[0].va + ops[0].range;
+	for (i = 1; i < n; i++) {
+		if (ops[i].va < lo_va)
+			lo_va = ops[i].va;
+		if (ops[i].va + ops[i].range > hi_va)
+			hi_va = ops[i].va + ops[i].range;
+	}
+	a = first_ending_after(vm->maps, 0, vm->nmaps, lo_va);
+	b = first_starting_at(vm->maps, a, vm->nmaps, hi_va);
+	win = b - a;
+
 	/* Everything below is one transaction: any failure restores the exact
-	 * previous tables and mapping table (whole-call atomic). */
+	 * previous tables and mapping table (whole-call atomic).
+	 * One allocation: resolved BOs, the staged window (each op adds at most
+	 * 2 records), the list of references to drop. */
 	rc = -XVC_ENOMEM;
-	cap = vm->nmaps + 2 * n;	/* each op adds at most 2 records */
-	bos = vm->ops->zalloc(vm->ctx, (size_t)n * sizeof(*bos));
-	staged = vm->ops->zalloc(vm->ctx, (size_t)cap * sizeof(*staged));
+	blk = vm->ops->zalloc(vm->ctx, (size_t)n * sizeof(*bos) + ((size_t)win + 2 * n) * sizeof(*s.m) +
+				       (size_t)win * sizeof(*s.drop));
 	xvc_pt_begin(vm);
-	if (!bos || !staged)
+	if (!blk)
 		goto fail;
+	bos = blk;
+	s.m = (struct xvc_map *)(bos + n);
+	s.drop = (void **)(s.m + win + 2 * n);
+	s.n = win;
+	s.ndrop = 0;
 	rc = validate(vm, ops, n, bos);	/* resolve BOs; caller holds the lock */
 	if (rc)
 		goto fail;
-	if (vm->nmaps)
-		memcpy(staged, vm->maps, (size_t)vm->nmaps * sizeof(*staged));
-	ns = vm->nmaps;
+	if (win)
+		memcpy(s.m, &vm->maps[a], (size_t)win * sizeof(*s.m));
 	for (i = 0; i < n; i++) {
 		const struct xvc_bind_op *o = &ops[i];
-		uint32_t at = carve(staged, &ns, o->va, o->range);
+		uint32_t at = carve(&s, o->va, o->range);
 		struct xvc_map rec;
 
 		memset(&rec, 0, sizeof(rec));
 		rec.va = o->va;
 		rec.size = o->range;
 		if (o->op == XVC_OP_MAP) {
-			rec.kind = XVC_OP_MAP;
+			rec.kind = XVC_OP_MAP | MAP_NEW;
 			rec.bo = bos[i].bo;
 			rec.bo_pa = bos[i].pa;
 			rec.bo_offset = o->bo_offset;
 			rec.flags = o->flags;
 			rc = xvc_pt_set(vm, o->va, o->range, XVC_OP_MAP, bos[i].pa + o->bo_offset,
 					xvc_leaf_attrs(o->flags));
-			insert_at(staged, &ns, at, &rec);
+			insert_at(&s, at, &rec);
 		} else if (o->op == XVC_OP_SPARSE_NULL) {
-			rec.kind = XVC_OP_SPARSE_NULL;
+			rec.kind = XVC_OP_SPARSE_NULL | MAP_NEW;
 			rc = xvc_pt_set(vm, o->va, o->range, XVC_OP_SPARSE_NULL, 0, 0);
-			insert_at(staged, &ns, at, &rec);
+			insert_at(&s, at, &rec);
 		} else {
 			rc = xvc_pt_set(vm, o->va, o->range, XVC_OP_UNMAP, 0, 0);
 		}
 		if (rc)
 			goto fail;
 	}
-	if (ns > vm->max_maps) {
+	new_n = vm->nmaps - win + s.n;
+	if (new_n > vm->max_maps) {
 		rc = -XVC_ENOSPC;
 		goto fail;
 	}
+	if (new_n > vm->maps_cap) {
+		/* the last allocation that can fail: still inside the transaction */
+		rc = -XVC_ENOMEM;
+		cap = maps_cap_for(vm, new_n);
+		grown = vm->ops->zalloc(vm->ctx, (size_t)cap * sizeof(*grown));
+		if (!grown)
+			goto fail;
+	}
 	xvc_pt_commit(vm);
-	/* references: take the new ones before dropping the old ones */
-	if (vm->ops->bo_get)
-		for (i = 0; i < ns; i++)
-			if (staged[i].bo)
-				vm->ops->bo_get(vm->ctx, staged[i].bo);
+	/* references of the records this call created (the BOs are pinned by the caller), before any is dropped */
+	for (i = 0; i < s.n; i++) {
+		if (!(s.m[i].kind & MAP_NEW))
+			continue;
+		s.m[i].kind &= ~MAP_NEW;
+		if (s.m[i].bo && vm->ops->bo_get)
+			vm->ops->bo_get(vm->ctx, s.m[i].bo);
+	}
+	if (grown) {
+		splice(vm, grown, a, b, &s);
+		if (vm->maps)
+			vm->ops->free(vm->ctx, vm->maps);
+		vm->maps = grown;
+		vm->maps_cap = cap;
+	} else {
+		splice(vm, vm->maps, a, b, &s);
+	}
+	vm->nmaps = new_n;
+	/* the GPU may still reach the unmapped BOs through stale TLB entries: drop their references only after the
+	 * invalidation (same order as before: get, invalidate, put) */
 	finish(vm);
-	put_maps(vm, vm->maps, vm->nmaps);
-	if (vm->maps)
-		vm->ops->free(vm->ctx, vm->maps);
-	vm->maps = staged;
-	vm->nmaps = ns;
-	vm->ops->free(vm->ctx, bos);
+	if (vm->ops->bo_put)
+		for (i = 0; i < s.ndrop; i++)
+			vm->ops->bo_put(vm->ctx, s.drop[i]);
+	vm->ops->free(vm->ctx, blk);
+	/* best effort: give back most of a table that shrank a lot (a failed allocation just keeps the old array) */
+	if (vm->maps_cap > 256 && new_n < vm->maps_cap / 4) {
+		cap = maps_cap_for(vm, new_n);
+		grown = vm->ops->zalloc(vm->ctx, (size_t)cap * sizeof(*grown));
+		if (grown) {
+			if (new_n)
+				memcpy(grown, vm->maps, (size_t)new_n * sizeof(*grown));
+			vm->ops->free(vm->ctx, vm->maps);
+			vm->maps = grown;
+			vm->maps_cap = cap;
+		}
+	}
 	return 0;
 
 fail:
 	xvc_pt_rollback(vm);
 	finish(vm);
-	if (staged)
-		vm->ops->free(vm->ctx, staged);
-	if (bos)
-		vm->ops->free(vm->ctx, bos);
+	if (blk)
+		vm->ops->free(vm->ctx, blk);
 	return rc;
 }

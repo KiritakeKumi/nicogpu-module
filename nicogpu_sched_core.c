@@ -8,8 +8,11 @@
 #define XSC_LOCK(c)		((c)->ops->lock((c)->ctx))
 #define XSC_UNLOCK(c)	((c)->ops->unlock((c)->ctx))
 
+/* a batch always has room for the largest job */
+typedef char xsc_batch_holds_a_job[XSC_BATCH_DW >= XSC_JOB_MAX_DW ? 1 : -1];
+
 /* ------------------------------------------------------------------------ */
-/* C3 front-region layout                                                   */
+/* C3 front-region layout */
 
 void xsc_c3_init(struct xsc_c3 *l, uint64_t limit)
 {
@@ -32,7 +35,7 @@ int xsc_c3_alloc(struct xsc_c3 *l, uint64_t size, uint64_t align, uint64_t *off)
 }
 
 /* ------------------------------------------------------------------------ */
-/* setup                                                                    */
+/* setup */
 
 int xsc_init(struct xsc_core *c, const struct xsc_ops *ops, void *ctx, const struct xsc_cfg *cfg)
 {
@@ -81,7 +84,7 @@ static void emit(const struct xsc_core *c, enum xsc_event ev, uint64_t a, uint64
 }
 
 /* ------------------------------------------------------------------------ */
-/* serialised entry points                                                  */
+/* serialised entry points */
 
 static int xsc_enter(struct xsc_core *c)
 {
@@ -106,18 +109,19 @@ static void xsc_leave(struct xsc_core *c)
 }
 
 /* ------------------------------------------------------------------------ */
-/* fences                                                                   */
+/* fences */
 
 static void fence_get(struct xsc_fence *f)
 {
 	f->refs++;
 }
 
-/* lock held */
+/* lock held.  A job's fence lives in the job's allocation (xsc_job_alloc): the job holds one reference until it is
+ * released, so the last reference frees the whole block, whoever drops it. */
 static void fence_put_locked(struct xsc_core *c, struct xsc_fence *f)
 {
 	if (--f->refs == 0 && f != &c->stub)
-		c->ops->free(c->ctx, f);
+		c->ops->free(c->ctx, f->blk ? f->blk : (void *)f);
 }
 
 struct xsc_fence *xsc_fence_alloc_external(struct xsc_core *c)
@@ -169,7 +173,7 @@ void xsc_fence_signal(struct xsc_core *c, struct xsc_fence *f, int err)
 }
 
 /* ------------------------------------------------------------------------ */
-/* syncobjs                                                                 */
+/* syncobjs */
 
 struct xsc_syncobj *xsc_syncobj_alloc(struct xsc_core *c, bool signaled)
 {
@@ -215,13 +219,24 @@ void xsc_syncobj_put(struct xsc_core *c, struct xsc_syncobj *so)
 	XSC_UNLOCK(c);
 }
 
-int xsc_syncobj_reset(struct xsc_core *c, struct xsc_syncobj *const *so, uint32_t n)
+/* RESET and SIGNAL resolve every handle first: all-or-nothing */
+static int syncobj_all_present(struct xsc_syncobj *const *so, uint32_t n)
 {
 	uint32_t i;
 
 	for (i = 0; i < n; i++)
 		if (!so[i])
 			return -XSC_ENOENT;
+	return 0;
+}
+
+int xsc_syncobj_reset(struct xsc_core *c, struct xsc_syncobj *const *so, uint32_t n)
+{
+	uint32_t i;
+	int rc = syncobj_all_present(so, n);
+
+	if (rc)
+		return rc;
 	XSC_LOCK(c);
 	for (i = 0; i < n; i++)
 		syncobj_set_locked(c, so[i], NULL);
@@ -232,10 +247,10 @@ int xsc_syncobj_reset(struct xsc_core *c, struct xsc_syncobj *const *so, uint32_
 int xsc_syncobj_signal(struct xsc_core *c, struct xsc_syncobj *const *so, uint32_t n)
 {
 	uint32_t i;
+	int rc = syncobj_all_present(so, n);
 
-	for (i = 0; i < n; i++)
-		if (!so[i])
-			return -XSC_ENOENT;
+	if (rc)
+		return rc;
 	XSC_LOCK(c);
 	for (i = 0; i < n; i++)
 		syncobj_set_locked(c, so[i], &c->stub);
@@ -252,8 +267,30 @@ void xsc_syncobj_attach(struct xsc_core *c, struct xsc_syncobj *so, struct xsc_f
 	XSC_UNLOCK(c);
 }
 
-int xsc_syncobj_wait_poll(struct xsc_core *c, struct xsc_syncobj *const *so, uint32_t n, uint32_t flags,
-			  uint32_t *first)
+/* The condition of a wait on one syncobj: *met = it holds; a non-zero return aborts the poll with that error. */
+typedef int (*syncobj_pred_fn)(const struct xsc_syncobj *so, uint32_t flags, bool *met);
+
+static int pred_signaled(const struct xsc_syncobj *so, uint32_t flags, bool *met)
+{
+	const struct xsc_fence *f = so->fence;
+
+	if (!f && !(flags & XSC_WAIT_FOR_SUBMIT))
+		return -XSC_EINVAL;	/* no WAIT_FOR_SUBMIT in HAL v0 */
+	*met = f && f->signaled;
+	return 0;
+}
+
+static int pred_available(const struct xsc_syncobj *so, uint32_t flags, bool *met)
+{
+	(void)flags;
+	*met = so->fence != NULL;
+	return 0;
+}
+
+/* One poll of n syncobjs: 0 when the condition holds for all (WAIT_ALL) or any of them, -ETIME if not yet.  *first = the
+ * first one that holds. */
+static int syncobj_poll(struct xsc_core *c, struct xsc_syncobj *const *so, uint32_t n, uint32_t flags,
+			syncobj_pred_fn pred, uint32_t *first)
 {
 	bool all = true;
 	int first_idx = -1, rc = 0;
@@ -263,21 +300,17 @@ int xsc_syncobj_wait_poll(struct xsc_core *c, struct xsc_syncobj *const *so, uin
 		return -XSC_EINVAL;
 	XSC_LOCK(c);
 	for (i = 0; i < n; i++) {
-		const struct xsc_fence *f;
-		bool sig;
+		bool met = false;
 
 		if (!so[i]) {
 			rc = -XSC_ENOENT;
 			break;
 		}
-		f = so[i]->fence;
-		if (!f && !(flags & XSC_WAIT_FOR_SUBMIT)) {
-			rc = -XSC_EINVAL;	/* no WAIT_FOR_SUBMIT in HAL v0 */
+		rc = pred(so[i], flags, &met);
+		if (rc)
 			break;
-		}
-		sig = f && f->signaled;
-		all = all && sig;
-		if (sig && first_idx < 0)
+		all = all && met;
+		if (met && first_idx < 0)
 			first_idx = (int)i;
 	}
 	if (!rc) {
@@ -289,41 +322,21 @@ int xsc_syncobj_wait_poll(struct xsc_core *c, struct xsc_syncobj *const *so, uin
 	}
 	XSC_UNLOCK(c);
 	return rc;
+}
+
+int xsc_syncobj_wait_poll(struct xsc_core *c, struct xsc_syncobj *const *so, uint32_t n, uint32_t flags,
+			  uint32_t *first)
+{
+	return syncobj_poll(c, so, n, flags, pred_signaled, first);
 }
 
 int xsc_syncobj_wait_avail_poll(struct xsc_core *c, struct xsc_syncobj *const *so, uint32_t n, uint32_t flags,
 				uint32_t *first)
 {
-	bool all = true;
-	int first_idx = -1, rc = 0;
-	uint32_t i;
-
-	if (!n || (flags & ~(XSC_WAIT_ALL | XSC_WAIT_FOR_SUBMIT)))
-		return -XSC_EINVAL;
-	XSC_LOCK(c);
-	for (i = 0; i < n; i++) {
-		bool avail;
-
-		if (!so[i]) {
-			rc = -XSC_ENOENT;
-			break;
-		}
-		avail = so[i]->fence != NULL;
-		all = all && avail;
-		if (avail && first_idx < 0)
-			first_idx = (int)i;
-	}
-	if (!rc) {
-		bool ok = (flags & XSC_WAIT_ALL) ? all : first_idx >= 0;
-
-		if (ok && first)
-			*first = (uint32_t)(first_idx < 0 ? 0 : first_idx);
-		rc = ok ? 0 : -XSC_ETIME;
-	}
-	XSC_UNLOCK(c);
-	return rc;
+	return syncobj_poll(c, so, n, flags, pred_available, first);
 }
 
+#ifndef __KERNEL__	/* host tests only */
 bool xsc_syncobj_signaled(struct xsc_core *c, struct xsc_syncobj *so)
 {
 	bool s;
@@ -333,6 +346,7 @@ bool xsc_syncobj_signaled(struct xsc_core *c, struct xsc_syncobj *so)
 	XSC_UNLOCK(c);
 	return s;
 }
+#endif /* !__KERNEL__ */
 
 int xsc_seq_status(struct xsc_core *c, uint64_t seq, int *err)
 {
@@ -365,7 +379,7 @@ int xsc_seq_status(struct xsc_core *c, uint64_t seq, int *err)
 }
 
 /* ------------------------------------------------------------------------ */
-/* queues                                                                   */
+/* queues */
 
 struct xsc_queue *xsc_queue_alloc(struct xsc_core *c, uint32_t vmid)
 {
@@ -460,8 +474,11 @@ void xsc_queue_flush(struct xsc_core *c, struct xsc_queue *q)
 }
 
 /* ------------------------------------------------------------------------ */
-/* jobs                                                                     */
+/* jobs */
 
+/* One allocation per job: [job][its fence][nib IBs][nwaits dependency pointers].  The fence can outlive the job
+ * (syncobjs, dependencies of later jobs, the dma_fence adapter hold references): the block is freed with the last
+ * fence reference (fence_put_locked), and the job's own reference is dropped when the job is released. */
 struct xsc_job *xsc_job_alloc(struct xsc_core *c, uint32_t nib, uint32_t nwaits)
 {
 	struct xsc_job *j;
@@ -470,19 +487,16 @@ struct xsc_job *xsc_job_alloc(struct xsc_core *c, uint32_t nib, uint32_t nwaits)
 
 	if (nib > XSC_MAX_IBS || nwaits > XSC_MAX_SYNCS)
 		return NULL;
-	sz = sizeof(*j) + (size_t)nib * sizeof(struct xsc_ib) + (size_t)nwaits * sizeof(struct xsc_fence *);
+	sz = sizeof(*j) + sizeof(*f) + (size_t)nib * sizeof(struct xsc_ib) + (size_t)nwaits * sizeof(struct xsc_fence *);
 	j = c->ops->zalloc(c->ctx, sz);
 	if (!j)
 		return NULL;
-	f = c->ops->zalloc(c->ctx, sizeof(*f));
-	if (!f) {
-		c->ops->free(c->ctx, j);
-		return NULL;
-	}
+	f = (struct xsc_fence *)(j + 1);
 	f->refs = 1;			/* the job's reference */
+	f->blk = j;
 	j->fence = f;
 	j->nib = nib;
-	j->ib = (struct xsc_ib *)(j + 1);
+	j->ib = (struct xsc_ib *)(f + 1);
 	j->deps_cap = nwaits;
 	j->deps = (struct xsc_fence **)(j->ib + nib);
 	return j;
@@ -503,8 +517,8 @@ static void job_release_locked(struct xsc_core *c, struct xsc_job *j)
 
 	for (i = 0; i < j->ndeps; i++)
 		fence_put_locked(c, j->deps[i]);
+	/* the job's fence reference; the last one frees the block (and `j`) -- nothing may touch `j` after this */
 	fence_put_locked(c, j->fence);
-	c->ops->free(c->ctx, j);
 }
 
 void xsc_job_free(struct xsc_core *c, struct xsc_job *j)
@@ -570,7 +584,7 @@ int xsc_submit(struct xsc_core *c, struct xsc_queue *q, struct xsc_job *j, const
 			goto out;
 		}
 		for (k = 0; k < i; k++) {
-			if (signals[k].so == signals[i].so) {
+			if (signals[k].so == signals[i].so) {	/* the same syncobj twice in `signals */
 				rc = -XSC_EINVAL;
 				goto out;
 			}
@@ -618,7 +632,7 @@ out:
 }
 
 /* ------------------------------------------------------------------------ */
-/* ring                                                                     */
+/* ring */
 
 uint32_t xsc_ring_free(const struct xsc_core *c)
 {
@@ -705,7 +719,7 @@ static void hist_add_locked(struct xsc_core *c, uint64_t seq, int err)
 }
 
 /* Retire jobs from the head of the in-flight list, in order, while they are
- * complete (fence value reached) or failed.  Lock held.  */
+ * complete (fence value reached) or failed.  Lock held. */
 static unsigned int retire_locked(struct xsc_core *c)
 {
 	unsigned int n = 0;
@@ -811,12 +825,14 @@ static void rptr_update_locked(struct xsc_core *c, uint32_t rptr)
 	c->rptr = rptr;
 }
 
+#ifndef __KERNEL__	/* host tests only */
 void xsc_rptr_update(struct xsc_core *c, uint32_t rptr)
 {
 	XSC_LOCK(c);
 	rptr_update_locked(c, rptr);
 	XSC_UNLOCK(c);
 }
+#endif /* !__KERNEL__ */
 
 static void fail_noguilt_locked(struct xsc_core *c, struct xsc_job *j, int err)
 {
@@ -909,11 +925,100 @@ static void fail_guilty_locked(struct xsc_core *c, struct xsc_job *j, int err, u
 	fail_noguilt_locked(c, j, err);
 }
 
+/* back into the seq-ordered pending list; lock held */
+static void pend_insert_locked(struct xsc_core *c, struct xsc_job *j)
+{
+	struct xsc_job *p = NULL, *k = c->pend_head;
+
+	while (k && k->fence->seq < j->fence->seq) {
+		p = k;
+		k = k->next;
+	}
+	j->next = k;
+	if (p)
+		p->next = j;
+	else
+		c->pend_head = j;
+	if (!k)
+		c->pend_tail = j;
+	c->n_pending++;
+}
+
+/* The batch c->batch[0, nb) never reached the CP (its ring write or its doorbell failed; the doorbell did not move):
+ * hand the ring space back, retire the first job with -EIO and return the others to the pending list -- what a
+ * per-job push would have left behind when that first job failed.  Lock held.  The batch jobs are exactly the tail
+ * of the in-flight list from batch[0] on (xsc_run pushes the batch before it retires anything else), so they give
+ * their ring sequence numbers back and flight_seq is batch[0]'s again. */
+static void batch_fail_locked(struct xsc_core *c, int rc)
+{
+	struct xsc_job *first = c->batch[0], *j, *nx;
+
+	c->wptr = first->ring_start;
+	first->ring_start = first->ring_end = 0;
+	c->io_err = true;
+	c->st.io_errors++;
+	emit(c, XSC_EV_IO_ERROR, (uint32_t)-rc, first->fence->seq);
+	fail_noguilt_locked(c, first, -XSC_EIO);
+	for (j = first->next; j; j = nx) {
+		nx = j->next;
+		c->n_inflight--;
+		j->state = XSC_JS_PENDING;
+		j->ring_start = j->ring_end = 0;
+		j->fence->rseq = 0;
+		pend_insert_locked(c, j);
+	}
+	first->next = NULL;
+	c->fl_tail = first;
+	c->flight_seq = first->fence->rseq;
+	retire_locked(c);
+}
+
+/* Write the reserved batch c->batch[0, nb) (consecutive ring space, state PUSHING) and commit it with one doorbell.
+ * Lock held on entry and exit, released while the device is accessed: nobody else touches PUSHING jobs (retirement
+ * stops at them, every other path that moves jobs is a serialised entry point).  0 or -EIO (batch_fail_locked). */
+static int batch_push_locked(struct xsc_core *c, uint32_t nb)
+{
+	struct xsc_job *first = c->batch[0], *last = c->batch[nb - 1];
+	uint32_t i, n = 0, wraps = 0;
+	bool wrapped = false;
+	int rc;
+
+	XSC_UNLOCK(c);
+	for (i = 0; i < nb; i++) {
+		const struct xsc_job *j = c->batch[i];
+
+		n += xsc_encode_job(c, j, c->pkt + n);
+		if ((j->ring_start & (c->ring_dw - 1)) + j->dw > c->ring_dw)
+			wraps++;		/* this job is split by the ring end */
+	}
+	rc = ring_put(c, first->ring_start, c->pkt, n, &wrapped);
+	if (!rc)
+		rc = c->ops->doorbell(c->ctx, last->ring_end);
+	XSC_LOCK(c);
+	if (rc) {
+		batch_fail_locked(c, rc);
+		return -XSC_EIO;
+	}
+	c->wptr_db = last->ring_end;
+	c->st.doorbells++;
+	c->st.ring_wraps += wraps;
+	c->st.pushed += nb;
+	for (i = 0; i < nb; i++)
+		c->batch[i]->state = XSC_JS_RING;
+	/* only batch[0] can be the head: the later ones are behind it */
+	if (c->fl_head == first)
+		head_start_locked(c, first, c->ops->now_ms(c->ctx));
+	/* the CP may have finished some before we got the lock back */
+	observe_locked(c, c->ops->read_fence(c->ctx));
+	return 0;
+}
+
 int xsc_run(struct xsc_core *c)
 {
 	int pushed = 0, rc = 0;
 	bool stalled = false;
 	struct xsc_job *prev = NULL;
+	uint32_t nb = 0, ndw = 0, nreord = 0;
 
 	if (xsc_enter(c))
 		return -XSC_EBUSY;
@@ -921,11 +1026,12 @@ int xsc_run(struct xsc_core *c)
 	if (!++c->scan_gen)
 		c->scan_gen = 1;
 	/* Walk the pending list in seq order.  A job whose dependencies are not ready blocks its own queue
-	 * (later jobs of that queue are skipped, they must stay behind it) but not the other queues. */
+	 * (later jobs of that queue are skipped, they must stay behind it) but not the other queues.  Ready jobs are
+	 * reserved (ring space, ring sequence number, in-flight list) into a batch; a full batch is written and
+	 * committed with one doorbell before the scan goes on, the last one when the scan ends. */
 	for (;;) {
 		struct xsc_job *j = prev ? prev->next : c->pend_head;
 		uint32_t i;
-		bool wrapped = false;
 
 		if (!j)
 			break;
@@ -934,8 +1040,22 @@ int xsc_run(struct xsc_core *c)
 				prev = j;
 				continue;
 			}
+			if (nb) {
+				/* push the batch first: it is ahead of this job in seq order (and in the in-flight list) */
+				rc = batch_push_locked(c, nb);
+				if (rc) {
+					nb = 0;
+					break;
+				}
+				pushed += (int)nb;
+				c->st.reordered += nreord;
+				nb = ndw = nreord = 0;
+				continue;	/* look at j again */
+			}
 			/* never reaches the CP: retire with an error, in order */
 			pend_unlink_locked(c, prev, j);
+			if (prev)
+				c->ooo = true;	/* retires ahead of an older job that stays pending: done_seq must not pass it */
 			fail_noguilt_locked(c, j, j->pre_err ? j->pre_err :
 					    c->io_err && !j->q->guilty ? -XSC_EIO : -XSC_ECANCELED);
 			fl_append_locked(c, j);
@@ -971,50 +1091,38 @@ int xsc_run(struct xsc_core *c)
 			c->st.ring_full++;
 			break;
 		}
+		if (nb == XSC_BATCH_JOBS || ndw + j->dw > XSC_BATCH_DW) {
+			rc = batch_push_locked(c, nb);
+			if (rc) {
+				nb = 0;
+				break;
+			}
+			pushed += (int)nb;
+			c->st.reordered += nreord;
+			nb = ndw = nreord = 0;
+			continue;	/* look at j again (prev is still in the pending list: only this scan unlinks) */
+		}
 
 		/* reserve; from here the job is visible to retire/timeouts */
 		pend_unlink_locked(c, prev, j);
 		if (prev) {			/* passed a blocked older job */
 			c->ooo = true;
-			c->st.reordered++;
+			nreord++;
 		}
 		j->ring_start = c->wptr;
 		c->wptr += j->dw;
 		j->ring_end = c->wptr;
 		j->state = XSC_JS_PUSHING;
 		fl_append_locked(c, j);
-		XSC_UNLOCK(c);
-
-		xsc_encode_job(c, j, c->pkt);
-		rc = ring_put(c, j->ring_start, c->pkt, j->dw, &wrapped);
-		if (!rc)
-			rc = c->ops->doorbell(c->ctx, j->ring_end);
-
-		XSC_LOCK(c);
-		if (wrapped)
-			c->st.ring_wraps++;
-		if (rc) {
-			/* nothing was committed to the CP (the doorbell did not move):
-			 * give the space back and retire the job with -EIO */
-			c->wptr = j->ring_start;
-			j->ring_start = j->ring_end = 0;
-			c->io_err = true;
-			c->st.io_errors++;
-			emit(c, XSC_EV_IO_ERROR, (uint32_t)-rc, j->fence->seq);
-			fail_noguilt_locked(c, j, -XSC_EIO);
-			retire_locked(c);
-			rc = -XSC_EIO;
-			break;
+		c->batch[nb++] = j;
+		ndw += j->dw;
+	}
+	if (nb) {
+		rc = batch_push_locked(c, nb);
+		if (!rc) {
+			pushed += (int)nb;
+			c->st.reordered += nreord;
 		}
-		c->wptr_db = j->ring_end;
-		c->st.doorbells++;
-		c->st.pushed++;
-		pushed++;
-		j->state = XSC_JS_RING;
-		if (c->fl_head == j)
-			head_start_locked(c, j, c->ops->now_ms(c->ctx));
-		/* the CP may have finished it before we got the lock back */
-		observe_locked(c, c->ops->read_fence(c->ctx));
 	}
 	c->busy = false;
 	XSC_UNLOCK(c);
@@ -1022,12 +1130,12 @@ int xsc_run(struct xsc_core *c)
 }
 
 /* ------------------------------------------------------------------------ */
-/* timeouts, CP errors, replay                                              */
+/* timeouts, CP errors, replay */
 
 /* Move every in-flight job back to the front of the pending list (a CP reset
  * or reload discarded the ring).  Jobs of a guilty queue and jobs that had
  * already failed keep an error and are retired by xsc_run without being
- * replayed (never replay a guilty queue).  Lock held;
+ * replayed.  Lock held;
  * returns the number of jobs that will really be replayed. */
 static uint32_t requeue_inflight_locked(struct xsc_core *c)
 {
@@ -1127,7 +1235,7 @@ static bool abort_timed_out(struct xsc_core *c, bool late)
 	return true;
 }
 
-/* a reset level only counts when the compute engine really stopped.  0 = idle (or no probe),
+/* A reset level only counts when the compute engine really stopped.  0 = idle (or no probe),
  * -ETIMEDOUT = still busy after XSC_ENGINE_IDLE_MS.  Worker, lock released. */
 static int engines_stopped(struct xsc_core *c)
 {
@@ -1179,7 +1287,7 @@ static int level_cp(struct xsc_core *c)
 	}
 }
 
-/* Level 2: reset the whole GPU zone (ops->gpu_reset), let
+/* level 2: reset the whole GPU zone (ops->gpu_reset), let
  * the glue restore what only the host knows (ops->rm_restore), run the CP bring-up
  * handshake again.  The RM's L2 dirty data is gone, so unless
  * XSC_CFG_L2_KEEP_CTX the other queues' contexts are declared lost (epoch bump:
@@ -1219,13 +1327,12 @@ static int declare_lost(struct xsc_core *c, int rc)
 }
 
 /* Recovery after a failure was attributed (or none: `full`).  busy held, lock
- * released.  Without XSC_CFG_ESCALATE this is the basic contract: one
- * ops->cp_reset, no escalation.  With it the reset ladder
- * starting at `from`:
+ * released.  Without XSC_CFG_ESCALATE this is the base contract: one
+ * ops->cp_reset, no escalation.  With it the ladder is, starting at `from`:
  *   CP    CP_CTRL.RESET (firmware alive) -> replay the other jobs
  *         (CP_FW_STATUS.ABORT_TIMEOUT afterwards -> straight to GPU, no L1 retry, no FW)
- *   FW    CORE_RESET + CP bring-up (firmware dead, or the CP did not idle) -> replay
- *   GPU   GPU-zone reset + restore + CP bring-up
+ *   FW    CORE_RESET + 7.4 (firmware dead, or the CP did not idle) -> replay
+ *   GPU   GPU-zone reset + restore + 7.4
  * and when everything fails: abort every job with -EIO and mark the device lost. */
 static int recover_from(struct xsc_core *c, enum xsc_reset_level from, bool full)
 {
@@ -1259,8 +1366,8 @@ static int recover_from(struct xsc_core *c, enum xsc_reset_level from, bool full
 			return ok;
 		}
 		emit(c, XSC_EV_RESET, XSC_RST_CP, (uint32_t)(rc > 0 ? XSC_EIO : -rc));
-		/* FWDEAD / ENGBUSY: the firmware reload (CORE_RESET) can cure it; ABTMO and a CP that does not idle:
-		 * the GPU-zone reset */
+		/* FWDEAD / ENGBUSY: the firmware reload (CORE_RESET) can cure it; ABTMO and a CP that does not idle
+		 * instead: the GPU-zone reset */
 		from = (rc == XSC_L1_FWDEAD || rc == XSC_L1_ENGBUSY) ? XSC_RST_FW : XSC_RST_GPU;
 	}
 	if (from <= XSC_RST_FW) {
@@ -1345,6 +1452,7 @@ static struct xsc_job *find_job_by_rptr(struct xsc_core *c, uint32_t rptr)
 	return NULL;
 }
 
+#ifndef __KERNEL__	/* host tests only */
 int xsc_seq_by_rptr(struct xsc_core *c, uint32_t rptr, uint64_t *seq)
 {
 	struct xsc_job *j;
@@ -1359,6 +1467,7 @@ int xsc_seq_by_rptr(struct xsc_core *c, uint32_t rptr, uint64_t *seq)
 	XSC_UNLOCK(c);
 	return rc;
 }
+#endif /* !__KERNEL__ */
 
 int xsc_cp_error(struct xsc_core *c, uint32_t error_rptr, uint32_t code)
 {
@@ -1420,6 +1529,18 @@ void xsc_mmu_fault(struct xsc_core *c, uint32_t status, uint64_t va, uint64_t pt
 	XSC_UNLOCK(c);
 }
 
+bool xsc_mmu_fault_newest(struct xsc_core *c, struct xsc_mmu_fault *out)
+{
+	bool ok;
+
+	XSC_LOCK(c);
+	ok = c->fault_n != 0;
+	if (ok)
+		*out = c->faults[(c->fault_n - 1) % XSC_FAULT_LOG];
+	XSC_UNLOCK(c);
+	return ok;
+}
+
 int xsc_cp_fw_event(struct xsc_core *c)
 {
 	const struct xsc_ops *o = c->ops;
@@ -1466,7 +1587,7 @@ int xsc_force_reset(struct xsc_core *c, enum xsc_reset_level level)
 		return rc;
 	XSC_LOCK(c);
 	if (c->lost && level < XSC_RST_FW)
-		level = XSC_RST_FW;		/* a lost device needs the CP bring-up handshake, not just CP_CTRL.RESET */
+		level = XSC_RST_FW;		/* a lost device needs the 7.4 handshake, not just CP_CTRL.RESET */
 	XSC_UNLOCK(c);
 	rc = recover_from(c, level, true);
 	xsc_leave(c);
@@ -1503,12 +1624,14 @@ bool xsc_is_lost(struct xsc_core *c)
 	return l;
 }
 
+#ifndef __KERNEL__	/* host tests only */
 void xsc_last_incident(struct xsc_core *c, struct xsc_incident *out)
 {
 	XSC_LOCK(c);
 	*out = c->inc;
 	XSC_UNLOCK(c);
 }
+#endif /* !__KERNEL__ */
 
 static void snap_job(const struct xsc_core *c, const struct xsc_job *j, uint64_t now, struct xsc_snap_job *o)
 {
@@ -1612,6 +1735,7 @@ uint32_t xsc_jobs_alive(struct xsc_core *c)
 	return xsc_fini(c);
 }
 
+#ifndef __KERNEL__	/* host tests only */
 uint32_t xsc_inflight(struct xsc_core *c)
 {
 	uint32_t n;
@@ -1621,9 +1745,9 @@ uint32_t xsc_inflight(struct xsc_core *c)
 	XSC_UNLOCK(c);
 	return n;
 }
+#endif /* !__KERNEL__ */
 
-/* ------------------------------------------------------------------------ */
-/* CP bring-up                                                              */
+/* ---- CP bring-up ------------------------------------------------------------ */
 
 /* busy held, lock released */
 static int bringup_inner(struct xsc_core *c)
@@ -1679,9 +1803,9 @@ static int bringup_inner(struct xsc_core *c)
 	} else {
 		o->reg_wr(c->ctx, NICOGPU_REG_CP_RPTR_WB_LO, 0);
 	}
-	/* The CP starts with an empty ring, but the position is not specified: power-up is
+	/* The CP starts with an empty ring, but the hardware does not say at which position: power-up is
 	 * 0, while the firmware core keeps WPTR across CORE_RESET (RPTR := WPTR).  Adopt what the
-	 * registers say; the doorbell may only advance from here.  If RPTR != WPTR the ring is not empty:
+	 * registers say; the doorbell may only advance from here (the FENCE rule).  If RPTR != WPTR the ring is not empty:
 	 * CP_CTRL.RESET (RPTR := WPTR; ENABLE is still 0) empties it, anything else is refused. */
 	rptr0 = o->reg_rd(c->ctx, NICOGPU_REG_CP_RING_RPTR);
 	wptr0 = o->reg_rd(c->ctx, NICOGPU_REG_CP_RING_WPTR);

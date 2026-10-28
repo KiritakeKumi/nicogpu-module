@@ -1,9 +1,26 @@
-// SPDX-License-Identifier: GPL-2.0 OR MIT
-/*
- * nicogpu_img.c -- CRC-32, SHA-256, XGCF (CP firmware) and XGPR (partial bitstream
- * container) validation.  See nicogpu_img.h.  No libc dependency beyond memcpy/memset.
- */
 #include "nicogpu_img.h"
+
+#ifdef __KERNEL__
+#include <crypto/sha2.h>
+#include <linux/crc32.h>
+#if __has_include(<linux/unaligned.h>)
+#include <linux/unaligned.h>
+#else
+#include <asm/unaligned.h>
+#endif
+
+#define le16(p)	get_unaligned_le16(p)
+#define le32(p)	get_unaligned_le32(p)
+#define le64(p)	get_unaligned_le64(p)
+
+/* ---- CRC-32 -------------------------------------------------------------------- */
+
+uint32_t xim_crc32(uint32_t crc, const void *buf, size_t len)
+{
+	/* zlib convention: the kernel's crc32_le() works on the raw (un-inverted) register */
+	return ~crc32_le(~crc, buf, len);
+}
+#else	/* host build: portable C, no kernel helpers */
 
 static uint16_t le16(const uint8_t *p)
 {
@@ -141,23 +158,25 @@ void xim_sha256_final(struct xim_sha256 *s, uint8_t out[32])
 	}
 }
 
-/* ---- XGCF ----------------------------------------------------------------------- */
+#endif /* !__KERNEL__ */
+
+/* ---- NGCF ----------------------------------------------------------------------- */
 
 static bool seg_ok(uint32_t off, uint32_t size, uint32_t image_size)
 {
-	return (off & 3u) == 0 && (size & 3u) == 0 && off >= XIM_XGCF_HDR_SIZE && off <= image_size &&
+	return (off & 3u) == 0 && (size & 3u) == 0 && off >= XIM_NGCF_HDR_SIZE && off <= image_size &&
 	       size <= image_size - off;
 }
 
-int xim_xgcf_check(const uint8_t *img, size_t len, size_t max_size, uint32_t cmd_major, uint32_t cmd_minor_min,
-		   struct xim_xgcf *out)
+int xim_ngcf_check(const uint8_t *img, size_t len, size_t max_size, uint32_t cmd_major, uint32_t cmd_minor_min,
+		   struct xim_ngcf *out)
 {
-	struct xim_xgcf f;
+	struct xim_ngcf f;
 	uint32_t i;
 
-	if (!img || len < XIM_XGCF_HDR_SIZE)
+	if (!img || len < XIM_NGCF_HDR_SIZE)
 		return -XIM_EINVAL;
-	if (le32(img) != XIM_XGCF_MAGIC || le32(img + 4) != 1u || le32(img + 16) != 0)
+	if ((le32(img) != XIM_NGCF_MAGIC && le32(img) != XIM_NGCF_MAGIC_LEGACY) || le32(img + 4) != 1u || le32(img + 16) != 0)
 		return -XIM_EINVAL;
 	for (i = 52; i < 64; i++)
 		if (img[i])
@@ -182,14 +201,14 @@ int xim_xgcf_check(const uint8_t *img, size_t len, size_t max_size, uint32_t cmd
 		return -XIM_EINVAL;		/* overlapping segments */
 	if (f.entry >= f.text_size || (f.entry & 1u))
 		return -XIM_EINVAL;
-	if ((f.entry & 0xffu) != XIM_XGCF_ENTRY_LOW)	/* Ibex reset vector = boot_addr + 0x80 */
+	if ((f.entry & 0xffu) != XIM_NGCF_ENTRY_LOW)	/* Ibex reset vector = boot_addr + 0x80 */
 		return -XIM_EINVAL;
-	if (f.text_size > XIM_XGCF_IMEM_BYTES)
+	if (f.text_size > XIM_NGCF_IMEM_BYTES)
 		return -XIM_EINVAL;
 	/* data + bss rounded up to words, in 64 bits (no wrap) */
-	if ((uint64_t)f.data_size + (((uint64_t)f.bss_size + 3u) & ~(uint64_t)3u) > XIM_XGCF_DMEM_BYTES)
+	if ((uint64_t)f.data_size + (((uint64_t)f.bss_size + 3u) & ~(uint64_t)3u) > XIM_NGCF_DMEM_BYTES)
 		return -XIM_EINVAL;
-	if (xim_crc32(0, img + XIM_XGCF_HDR_SIZE, len - XIM_XGCF_HDR_SIZE) != le32(img + 48))
+	if (xim_crc32(0, img + XIM_NGCF_HDR_SIZE, len - XIM_NGCF_HDR_SIZE) != le32(img + 48))
 		return -XIM_EBADMSG;
 	if ((f.cmd_version >> 16) != cmd_major || (f.cmd_version & 0xffffu) < cmd_minor_min)
 		return -XIM_EPROTO;
@@ -198,18 +217,18 @@ int xim_xgcf_check(const uint8_t *img, size_t len, size_t max_size, uint32_t cmd
 	return 0;
 }
 
-/* ---- XGPR ----------------------------------------------------------------------- */
+/* ---- NGPR ----------------------------------------------------------------------- */
 
-int xim_xgpr_parse(const uint8_t *img, size_t len, uint32_t max_payload, struct xim_xgpr *out)
+int xim_ngpr_parse(const uint8_t *img, size_t len, uint32_t max_payload, struct xim_ngpr *out)
 {
-	struct xim_xgpr x;
+	struct xim_ngpr x;
 	uint32_t i;
 
-	if (!img || len < XIM_XGPR_HDR_SIZE)
+	if (!img || len < XIM_NGPR_HDR_SIZE)
 		return -XIM_EINVAL;
 	x.hdr_version = le16(img + 4);
 	x.hdr_size = le16(img + 6);
-	if (le32(img) != XIM_XGPR_MAGIC || x.hdr_version != 1 || x.hdr_size != XIM_XGPR_HDR_SIZE)
+	if ((le32(img) != XIM_NGPR_MAGIC && le32(img) != XIM_NGPR_MAGIC_LEGACY) || x.hdr_version != 1 || x.hdr_size != XIM_NGPR_HDR_SIZE)
 		return -XIM_EINVAL;
 	x.shell_uid = le64(img + 8);
 	x.iface_version = le16(img + 0x10);
@@ -222,31 +241,30 @@ int xim_xgpr_parse(const uint8_t *img, size_t len, uint32_t max_payload, struct 
 	memcpy(x.sha256, img + 0x20, 32);
 	x.clk_core_khz = le32(img + 0x40);
 	x.clk_l2_khz = le32(img + 0x44);
-	if (x.flags || (x.mem_mask & ~XIM_XGPR_RM_MEM_MASK))
+	if (x.flags || (x.mem_mask & ~XIM_NGPR_RM_MEM_MASK))
 		return -XIM_EINVAL;
-	for (i = 0x48; i < XIM_XGPR_HDR_SIZE; i++)
+	for (i = 0x48; i < XIM_NGPR_HDR_SIZE; i++)
 		if (img[i])
 			return -XIM_EINVAL;
 	if (!x.payload_bytes || (x.payload_bytes & 3u))
 		return -XIM_EINVAL;
 	if (x.payload_bytes > max_payload)
 		return -XIM_E2BIG;
-	if ((uint64_t)len != (uint64_t)XIM_XGPR_HDR_SIZE + x.payload_bytes)
+	if ((uint64_t)len != (uint64_t)XIM_NGPR_HDR_SIZE + x.payload_bytes)
 		return -XIM_EINVAL;
-	x.payload = img + XIM_XGPR_HDR_SIZE;
+	x.payload = img + XIM_NGPR_HDR_SIZE;
 	if (out)
 		*out = x;
 	return 0;
 }
 
-int xim_xgpr_check(const uint8_t *img, size_t len, const struct xim_xgpr_policy *pol, struct xim_xgpr *out)
+int xim_ngpr_check(const uint8_t *img, size_t len, const struct xim_ngpr_policy *pol, struct xim_ngpr *out)
 {
-	struct xim_xgpr x;
-	struct xim_sha256 s;
+	struct xim_ngpr x;
 	uint8_t d[32];
 	int rc;
 
-	rc = xim_xgpr_parse(img, len, pol->max_payload, &x);
+	rc = xim_ngpr_parse(img, len, pol->max_payload, &x);
 	if (rc)
 		return rc;
 	if (x.shell_uid != pol->shell_uid)
@@ -254,9 +272,17 @@ int xim_xgpr_check(const uint8_t *img, size_t len, const struct xim_xgpr_policy 
 	if ((x.iface_version >> 8) != (pol->shell_iface >> 8) ||
 	    (x.iface_version & 0xffu) > (pol->shell_iface & 0xffu))
 		return -XIM_EPROTO;
-	xim_sha256_init(&s);
-	xim_sha256_update(&s, x.payload, x.payload_bytes);
-	xim_sha256_final(&s, d);
+#ifdef __KERNEL__
+	sha256(x.payload, x.payload_bytes, d);
+#else
+	{
+		struct xim_sha256 s;
+
+		xim_sha256_init(&s);
+		xim_sha256_update(&s, x.payload, x.payload_bytes);
+		xim_sha256_final(&s, d);
+	}
+#endif
 	if (memcmp(d, x.sha256, 32) != 0)
 		return -XIM_EBADMSG;
 	if (out)

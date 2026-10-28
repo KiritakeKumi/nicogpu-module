@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-// nicogpu_debugfs.c -- /sys/kernel/debug/nicogpu-<bdf>/{shell,clk,irq,bars,sched,icap}, read-only, and, root only,
+// nicogpu_debugfs.c -- /sys/kernel/debug/nicogpu-<bdf>/{shell,clk,irq,bars,sched,icap}, read-only, and (root only)
 // the write-only operator files `reset` ("1" CP_CTRL.RESET, "2" firmware reload, "3" GPU-zone reset), `pr_load`
-// (firmware name of an XGPR container for request_firmware()) and `dump` (take a devcoredump).
+// (firmware name of an NGPR container for request_firmware()) and `dump` (take a devcoredump).
 #include <linux/seq_file.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
@@ -10,27 +10,30 @@
 static int shell_show(struct seq_file *m, void *p)
 {
 	struct nicogpu_dev *x = m->private;
-	u32 st = xg_rd(x, NICOGPU_BAR_SHELL, SH_STATUS), rs = xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS);
-	u32 v = xg_rd(x, NICOGPU_BAR_SHELL, SH_VERSION), caps = xg_rd(x, NICOGPU_BAR_SHELL, SH_CAPS);
+	u32 st = ng_rd(x, NICOGPU_BAR_SHELL, SH_STATUS), rs = ng_rd(x, NICOGPU_BAR_SHELL, RM_STATUS);
+	u32 v = ng_rd(x, NICOGPU_BAR_SHELL, SH_VERSION), caps = ng_rd(x, NICOGPU_BAR_SHELL, SH_CAPS);
 
-	seq_printf(m, "SHELL_ID       %08x\n", xg_rd(x, NICOGPU_BAR_SHELL, SH_ID));
+	seq_printf(m, "SHELL_ID       %08x\n", ng_rd(x, NICOGPU_BAR_SHELL, SH_ID));
 	seq_printf(m, "SHELL_VERSION  %08x (rev %u, iface %04x)\n", v, v & 0xFFFF, v >> 16);
 	seq_printf(m, "SHELL_CAPS     %08x (icap %u clk_drp %u jtag_axi %u mem_present %x msi_vec %u)\n",
-		   caps, caps & 1, caps >> 1 & 1, caps >> 2 & 1, caps >> 8 & 0xF, caps >> 12 & 0xF);
-	seq_printf(m, "SHELL_UID      %08x_%08x\n", xg_rd(x, NICOGPU_BAR_SHELL, SH_UID_HI),
-		   xg_rd(x, NICOGPU_BAR_SHELL, SH_UID_LO));
+		   caps, !!(caps & SH_CAPS_ICAP), !!(caps & SH_CAPS_CLK_DRP), !!(caps & SH_CAPS_JTAG_AXI),
+		   caps >> SH_CAPS_MEM_SHIFT & 0xF, caps >> SH_CAPS_MSI_SHIFT & 0xF);
+	seq_printf(m, "SHELL_UID      %08x_%08x\n", ng_rd(x, NICOGPU_BAR_SHELL, SH_UID_HI),
+		   ng_rd(x, NICOGPU_BAR_SHELL, SH_UID_LO));
 	seq_printf(m, "SHELL_STATUS   %08x (si_done %u si_err %u mmcm %u calib %x link %u fence_stuck %u)\n",
-		   st, st & 1, st >> 1 & 1, st >> 2 & 1, st >> 4 & 0xF, st >> 8 & 1, st >> 9 & 1);
+		   st, !!(st & SH_ST_SI_DONE), !!(st & SH_ST_SI_ERR), !!(st & SH_ST_MMCM), st >> SH_ST_CALIB_SHIFT & 0xF,
+		   !!(st & SH_ST_LINK), !!(st & SH_ST_FENCE_STUCK));
 	seq_printf(m, "RM_STATUS      %08x (decoupled %u in_reset %u ready %u info_valid %u iface_ok %u mem_ok %u)\n",
-		   rs, rs >> 2 & 1, rs >> 3 & 1, rs >> 4 & 1, rs >> 5 & 1, rs >> 6 & 1, rs >> 8 & 1);
-	seq_printf(m, "RM_CTRL        %08x\n", xg_rd(x, NICOGPU_BAR_SHELL, RM_CTRL));
+		   rs, !!(rs & RM_ST_DECOUPLED), !!(rs & RM_ST_IN_RESET), !!(rs & RM_ST_READY), !!(rs & RM_ST_INFO_VALID),
+		   !!(rs & RM_ST_IFACE_OK), !!(rs & RM_ST_MEM_OK));
+	seq_printf(m, "RM_CTRL        %08x\n", ng_rd(x, NICOGPU_BAR_SHELL, RM_CTRL));
 	seq_printf(m, "RM_INFO        %08x %08x %08x %08x\n",
-		   xg_rd(x, NICOGPU_BAR_SHELL, RM_INFO3), xg_rd(x, NICOGPU_BAR_SHELL, RM_INFO2),
-		   xg_rd(x, NICOGPU_BAR_SHELL, RM_INFO1), xg_rd(x, NICOGPU_BAR_SHELL, RM_INFO0));
-	seq_printf(m, "RM_ERR_COUNT   %u\n", xg_rd(x, NICOGPU_BAR_SHELL, RM_ERR_COUNT));
-	seq_printf(m, "PR_STATUS      %08x\n", xg_rd(x, NICOGPU_BAR_SHELL, PR_STATUS));
+		   ng_rd(x, NICOGPU_BAR_SHELL, RM_INFO3), ng_rd(x, NICOGPU_BAR_SHELL, RM_INFO2),
+		   ng_rd(x, NICOGPU_BAR_SHELL, RM_INFO1), ng_rd(x, NICOGPU_BAR_SHELL, RM_INFO0));
+	seq_printf(m, "RM_ERR_COUNT   %u\n", ng_rd(x, NICOGPU_BAR_SHELL, RM_ERR_COUNT));
+	seq_printf(m, "PR_STATUS      %08x\n", ng_rd(x, NICOGPU_BAR_SHELL, PR_STATUS));
 	seq_printf(m, "BAR0_ID        %08x (ffffffff = isolated)\n",
-		   (rs & RM_ST_DECOUPLED) ? 0xFFFFFFFFu : xg_rd(x, NICOGPU_BAR_CTRL, RM_ID));
+		   (rs & RM_ST_DECOUPLED) ? 0xFFFFFFFFu : ng_rd(x, NICOGPU_BAR_CTRL, RM_ID));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(shell);
@@ -40,10 +43,10 @@ static int clk_show(struct seq_file *m, void *p)
 	struct nicogpu_dev *x = m->private;
 
 	seq_printf(m, "CLK_CTRL %08x CLK_STATUS %08x (locked/gated bits 0/1)\n",
-		   xg_rd(x, NICOGPU_BAR_SHELL, CLK_CTRL), xg_rd(x, NICOGPU_BAR_SHELL, CLK_STATUS));
+		   ng_rd(x, NICOGPU_BAR_SHELL, CLK_CTRL), ng_rd(x, NICOGPU_BAR_SHELL, CLK_STATUS));
 	seq_printf(m, "CLK_FREQ core %u kHz  core2x %u kHz  l2 %u kHz  ts %u kHz\n",
-		   xg_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_CORE), xg_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_CORE2X),
-		   xg_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_L2), xg_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_TS));
+		   ng_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_CORE), ng_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_CORE2X),
+		   ng_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_L2), ng_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_TS));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(clk);
@@ -56,8 +59,8 @@ static int irq_show(struct seq_file *m, void *p)
 	seq_printf(m, "irq_count     %lld\n", atomic64_read(&x->irq_count));
 	seq_printf(m, "shell_latched %08x\n", atomic_read(&x->irq_shell_latched));
 	seq_printf(m, "rm_latched    %08x\n", atomic_read(&x->irq_rm_latched));
-	seq_printf(m, "SHELL_IRQ_STATUS %08x ENABLE %08x\n", xg_rd(x, NICOGPU_BAR_SHELL, SH_IRQ_STATUS),
-		   xg_rd(x, NICOGPU_BAR_SHELL, SH_IRQ_ENABLE));
+	seq_printf(m, "SHELL_IRQ_STATUS %08x ENABLE %08x\n", ng_rd(x, NICOGPU_BAR_SHELL, SH_IRQ_STATUS),
+		   ng_rd(x, NICOGPU_BAR_SHELL, SH_IRQ_ENABLE));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(irq);

@@ -4,10 +4,6 @@
  */
 #include "nicogpu_dump_core.h"
 
-#define SH_STATUS	0x0020u
-#define SH_IRQ_STATUS	0x0040u
-#define SH_IRQ_ENABLE	0x0044u
-
 /* ---- bounded writer ------------------------------------------------------------ */
 
 struct w {
@@ -216,7 +212,7 @@ void xdd_collect_regs(const struct xdd_io *io, struct xdd_regs *out)
 		uint32_t off;
 	} shell[] = {
 		{ "SHELL_VERSION", XDF_SH_VERSION }, { "SHELL_UID_LO", XDF_SH_UID_LO }, { "SHELL_UID_HI", XDF_SH_UID_HI },
-		{ "SHELL_STATUS", SH_STATUS }, { "SHELL_IRQ_STATUS", SH_IRQ_STATUS }, { "SHELL_IRQ_ENABLE", SH_IRQ_ENABLE },
+		{ "SHELL_STATUS", XDD_SH_STATUS }, { "SHELL_IRQ_STATUS", XDD_SH_IRQ_STATUS }, { "SHELL_IRQ_ENABLE", XDD_SH_IRQ_ENABLE },
 		{ "RM_CTRL", XDF_RM_CTRL }, { "RM_STATUS", XDF_RM_STATUS }, { "RM_OUTSTANDING", XDF_RM_OUTSTANDING },
 		{ "RM_INFO0", XDF_RM_INFO0 }, { "RM_INFO1", XDF_RM_INFO0 + 4 }, { "RM_INFO2", XDF_RM_INFO0 + 8 },
 		{ "RM_INFO3", XDF_RM_INFO0 + 12 }, { "RM_ERR_COUNT", XDF_RM_ERR_COUNT }, { "PR_STATUS", XDF_PR_STATUS },
@@ -248,7 +244,7 @@ void xdd_collect_regs(const struct xdd_io *io, struct xdd_regs *out)
 	for (i = 0; i < sizeof(shell) / sizeof(shell[0]); i++)
 		add_reg(out, shell[i].name, 1, shell[i].off, io->shell_rd(io->ctx, shell[i].off), true);
 	st = io->shell_rd(io->ctx, XDF_RM_STATUS);
-	out->rm_visible = !(st & XDF_ST_DECOUPLED) && io->rm_rd(io->ctx, XDF_RM_ID) == XDF_RM_ID_MAGIC;
+	out->rm_visible = !(st & XDF_ST_DECOUPLED) && xdf_rm_id_ok(io->rm_rd(io->ctx, XDF_RM_ID));
 	for (i = 0; i < sizeof(rm) / sizeof(rm[0]); i++)
 		add_reg(out, rm[i].name, 0, rm[i].off, out->rm_visible ? io->rm_rd(io->ctx, rm[i].off) : 0, out->rm_visible);
 }

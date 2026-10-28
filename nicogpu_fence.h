@@ -49,7 +49,7 @@ struct nicogpu_fctx {
 struct nicogpu_fences;
 
 struct nicogpu_fence {
-	struct dma_fence base;	/* first: ops->release frees through dma_fence_free() */
+	struct dma_fence base;	/* first: ops->release frees through dma_fence_free */
 	struct nicogpu_fctx *ctx;
 	struct nicogpu_fences *fs;	/* != NULL: armed and not yet harvested (identity of the owning device); fs->lock */
 	struct xsc_fence *xf;	/* the core fence; one reference held until the fence is signalled */

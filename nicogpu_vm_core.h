@@ -9,11 +9,11 @@
  * glue (nicogpu_mm.c) only supplies memory, MMIO and BO reference callbacks.
  *
  * Semantics are a C port of the functional model, which is the reference:
-// ABI in nicogpu_uapi.h.
+ *   - page-table writer      (PageTableBuilder of the model):
  *     page size choice 2M > 64K > 4K, split/demote/collapse, retired pages,
  *     begin/commit/rollback journal -- same algorithm, same table contents,
  *     same allocation order;
- *   - VM_BIND batch (vm_bind):
+ *   - VM_BIND batch          (the model's sim backend, vm_bind()):
  *     validate everything first, apply in array order with replace semantics,
  *     whole-call atomic on any failure including OOM,
  *     invalidate the VMID on both paths, then
@@ -45,17 +45,18 @@
 #include <stdint.h>
 #include <string.h>
 #endif
+#include "nicogpu_errno.h"
 #include "nicogpu_pte.h"	/* generated, vendored in gen/ */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Linux errno values, returned negated. */
-#define XVC_ENOENT	2
-#define XVC_ENOMEM	12
-#define XVC_EINVAL	22
-#define XVC_ENOSPC	28
+/* Linux errno values, returned negated (aliases of the shared table, nicogpu_errno.h). */
+#define XVC_ENOENT	NGE_NOENT
+#define XVC_ENOMEM	NGE_NOMEM
+#define XVC_EINVAL	NGE_INVAL
+#define XVC_ENOSPC	NGE_NOSPC
 
 /* HAL v0 constants (frozen); nicogpu_uapi.h
  * exports the same values. */
@@ -137,7 +138,7 @@ bool xvc_pool_alloc(struct xvc_pool *p, uint64_t size, uint64_t align, uint64_t 
 void xvc_pool_free(struct xvc_pool *p, uint64_t addr, uint64_t size);
 
 /* ---- entry decoding (rules D1..D15) ---- */
-enum xvc_kind {			/* == NICOGPU_PTE_KIND_* */
+enum xvc_kind {			/* == NICOGPU_PTE_KIND_* of nicogpu_pte_vectors.h */
 	XVC_NOT_PRESENT = 0,
 	XVC_BAD_PTE = 1,
 	XVC_SPARSE_NULL = 2,
@@ -171,16 +172,17 @@ struct xvc_vm {
 	struct xvc_pt *root;
 	bool large;			/* allow 64K/2M pages (default true) */
 	size_t tables;			/* live tables incl. root */
-	struct xvc_pt *retired;		/* unlinked, freed by reclaim() */
+	struct xvc_pt *retired;		/* unlinked, freed by reclaim */
 	bool reclaim_blocked;		/* last invalidate timed out */
 	/* transaction */
 	bool txn;
 	struct xvc_jchunk *journal;
 	struct xvc_pt *txn_alloc;
-	struct xvc_pt *txn_mark;	/* retired head at begin() */
+	struct xvc_pt *txn_mark;	/* retired head at begin */
 	/* mapping table, sorted by va, non-overlapping */
-	struct xvc_map *maps;
+	struct xvc_map *maps;		/* room for maps_cap records */
 	uint32_t nmaps;
+	uint32_t maps_cap;
 	uint32_t max_maps;		/* default XVC_MAX_MAPPINGS */
 };
 
@@ -191,7 +193,7 @@ int xvc_vm_init(struct xvc_vm *vm, const struct xvc_ops *ops, void *ctx);
 void xvc_vm_fini(struct xvc_vm *vm);
 uint64_t xvc_vm_root_pa(const struct xvc_vm *vm);
 
-/* VM_BIND (HAL v0).  0, -EINVAL, -ENOENT (unknown BO handle),
+/* VM_BIND (HAL v0 section 3).  0, -EINVAL, -ENOENT (unknown BO handle),
  * -ENOMEM (any allocation failed: nothing changed), -ENOSPC (mapping limit:
  * nothing changed). */
 int xvc_vm_bind(struct xvc_vm *vm, const struct xvc_bind_op *ops, uint32_t n);
@@ -204,7 +206,9 @@ void xvc_pt_begin(struct xvc_vm *vm);
 void xvc_pt_commit(struct xvc_vm *vm);
 void xvc_pt_rollback(struct xvc_vm *vm);
 size_t xvc_pt_reclaim(struct xvc_vm *vm);
+#ifndef __KERNEL__	/* host tests only: not part of the module */
 size_t xvc_pt_retired(const struct xvc_vm *vm);
+#endif
 uint64_t xvc_leaf_attrs(uint32_t vm_flags);
 
 /* Walk the shadow tables like the MMU walker. */
@@ -217,6 +221,7 @@ struct xvc_xlate {
 };
 void xvc_vm_lookup(const struct xvc_vm *vm, uint64_t va, struct xvc_xlate *out);
 
+#ifndef __KERNEL__	/* host tests only: not part of the module */
 /* Invariants of the live tables (PageTableBuilder::verify).  0 or a static
  * description of the first violation. */
 const char *xvc_vm_verify(const struct xvc_vm *vm);
@@ -227,6 +232,7 @@ uint64_t xvc_fnv_mix(uint64_t h, uint64_t v);
 uint64_t xvc_vm_digest(const struct xvc_vm *vm, uint64_t h);
 
 #define XVC_FNV_SEED UINT64_C(1469598103934665603)
+#endif
 
 #ifdef __cplusplus
 }

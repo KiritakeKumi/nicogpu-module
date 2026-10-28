@@ -30,14 +30,15 @@
 #include <linux/uaccess.h>
 #include <linux/list.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/capability.h>
 #include <linux/property.h>
 #include <linux/dma-mapping.h>
-#include <drm/drm_prime.h>	/* drm_gem_prime_export() */
+#include <drm/drm_prime.h>	/* drm_gem_prime_export */
 #include "nicogpu_drv.h"
 
-/* Layout of C3 and of BAR2 (PROVISIONAL). */
+/* Layout of C3 and of BAR2 (PROVISIONAL; ring/firmware are). */
 #define NICOGPU_BAR2_LEN		SZ_256M
 #define NICOGPU_C3_WIN_LOG2	24			/* 16 MiB window: spec recommendation */
 #define NICOGPU_C3_WIN_SIZE	(1ULL << NICOGPU_C3_WIN_LOG2)
@@ -80,24 +81,24 @@ struct nicogpu_bo {
 struct nicogpu_vm {
 	struct xvc_vm core;
 	struct nicogpu_file *xf;
-	struct xarray pin;	/* handle -> nicogpu_bo, referenced: the BOs of the VM_BIND in progress (xf->lock) */
+	struct xarray pin;	/* handle -> nicogpu_bo, referenced: the BOs of the VM_BIND in progress (xf->vm_lock) */
 	u32 vmid;
 	bool hw;		/* tables mirrored to C3, MMU context enabled */
 };
 
 /* ---- device state helpers ---------------------------------------------- */
 
-static bool rm_present(struct nicogpu_dev *x)
-{
-	return !(xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS) & RM_ST_DECOUPLED);
-}
-
 /* RM kind from the shell's RM_INFO (valid after a PR load); 0 = no RM / decoupled / not identified */
 u32 nicogpu_rm_kind(struct nicogpu_dev *x)
 {
-	if (!rm_present(x) || xg_rd(x, NICOGPU_BAR_SHELL, RM_INFO0) != XGI_RMINFO_MAGIC)
+	u32 magic;
+
+	if (!ng_rm_present(x))
 		return 0;
-	return xg_rd(x, NICOGPU_BAR_SHELL, RM_INFO1) >> 16;
+	magic = ng_rd(x, NICOGPU_BAR_SHELL, RM_INFO0);
+	if (magic != NGI_RMINFO_MAGIC && magic != NGI_RMINFO_MAGIC_LEGACY)
+		return 0;
+	return ng_rd(x, NICOGPU_BAR_SHELL, RM_INFO1) >> 16;
 }
 
 /* RM with the v0.2 BAR2 window (and therefore the MMU) behind BAR0? */
@@ -105,11 +106,11 @@ static bool rm_has_mmu(struct nicogpu_dev *x)
 {
 	u32 info;
 
-	if (!x->mm.mmu_possible || !rm_present(x))
+	if (!x->mm.mmu_possible || !ng_rm_present(x))
 		return false;
-	if (xg_rd(x, NICOGPU_BAR_CTRL, RM_ID) != RM_ID_MAGIC)
+	if (!ng_rm_id_ok(ng_rd(x, NICOGPU_BAR_CTRL, RM_ID)))
 		return false;
-	info = xg_rd(x, NICOGPU_BAR_CTRL, RM_BAR2_INFO);
+	info = ng_rd(x, NICOGPU_BAR_CTRL, RM_BAR2_INFO);
 	if (!info || info == 0xffffffffu)
 		return false;
 	return (info & 0xff) == 28 && ((info >> 8) & 0xff) <= NICOGPU_C3_WIN_LOG2 &&
@@ -121,11 +122,11 @@ static int win_enable(struct nicogpu_dev *x)
 	struct nicogpu_mm *m = &x->mm;
 	u32 c;
 
-	xg_wr(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL, C3_WIN_ENABLE | (NICOGPU_C3_WIN_LOG2 << C3_WIN_SIZE_SHIFT));
-	xg_wr(x, NICOGPU_BAR_CTRL, RM_C3_WIN_BASE, 0);
-	c = xg_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL);	/* read-back: mapping is live */
+	ng_wr(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL, C3_WIN_ENABLE | (NICOGPU_C3_WIN_LOG2 << C3_WIN_SIZE_SHIFT));
+	ng_wr(x, NICOGPU_BAR_CTRL, RM_C3_WIN_BASE, 0);
+	c = ng_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL);	/* read-back: mapping is live */
 	if ((c & C3_WIN_ERR) || !(c & C3_WIN_ENABLE)) {
-		xg_wr(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL, 0);
+		ng_wr(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL, 0);
 		dev_err(&x->pdev->dev, "C3 window rejected (CTRL=%08x)\n", c);
 		return -EIO;
 	}
@@ -141,12 +142,12 @@ static bool win_alive(struct nicogpu_dev *x)
 	u32 c, st;
 	bool ok;
 
-	st = xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS);
+	st = ng_rd(x, NICOGPU_BAR_SHELL, RM_STATUS);
 	if (st & RM_ST_DECOUPLED) {
 		dev_warn_ratelimited(&x->pdev->dev, "win_alive: RM decoupled (RM_STATUS %08x)\n", st);
 		return false;
 	}
-	c = xg_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL);
+	c = ng_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL);
 	ok = (c & C3_WIN_ENABLE) && !(c & C3_WIN_ERR) && ((c >> C3_WIN_SIZE_SHIFT) & 0x1f) == NICOGPU_C3_WIN_LOG2;
 	if (!ok)
 		dev_warn_ratelimited(&x->pdev->dev, "win_alive: C3_WIN_CTRL read %08x (RM_STATUS %08x)\n", c, st);
@@ -165,9 +166,9 @@ static void __iomem *c3_ptr(struct nicogpu_dev *x, u64 off)
 		u32 c;
 
 		wmb();
-		(void)xg_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL);
-		xg_wr(x, NICOGPU_BAR_CTRL, RM_C3_WIN_BASE, (u32)base);
-		c = xg_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL);
+		(void)ng_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL);
+		ng_wr(x, NICOGPU_BAR_CTRL, RM_C3_WIN_BASE, (u32)base);
+		c = ng_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL);
 		if (c & C3_WIN_ERR)
 			m->io_err = true;
 		m->win_base = base;
@@ -177,18 +178,12 @@ static void __iomem *c3_ptr(struct nicogpu_dev *x, u64 off)
 
 static bool mmu_inval_wait(struct nicogpu_dev *x, u32 mask)
 {
-	unsigned long end = jiffies + msecs_to_jiffies(NICOGPU_INVAL_TIMEOUT_MS);
+	u32 v;
 
-	xg_wr(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_INVALIDATE, mask);
-	for (;;) {
-		u32 v = xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_INVALIDATE);
-
-		if (v != 0xffffffffu && !(v & mask))
-			return true;
-		if (time_after(jiffies, end))
-			return false;
-		usleep_range(5, 20);
-	}
+	ng_wr(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_INVALIDATE, mask);
+	return !read_poll_timeout(ng_rd, v, v != 0xffffffffu && !(v & mask), 20,
+				  NICOGPU_INVAL_TIMEOUT_MS * USEC_PER_MSEC, false, x, NICOGPU_BAR_CTRL,
+				  NICOGPU_REG_MMU_INVALIDATE);
 }
 
 static u32 ctx_reg(u32 vmid, u32 reg)
@@ -200,15 +195,15 @@ static bool ctx_enable(struct nicogpu_dev *x, u32 vmid, u64 root)
 {
 	/* the root table was filled through the window: push it first */
 	wmb();
-	xg_wr(x, NICOGPU_BAR_CTRL, ctx_reg(vmid, NICOGPU_REG_MMU_CTX_ROOT_LO), lower_32_bits(root));
-	xg_wr(x, NICOGPU_BAR_CTRL, ctx_reg(vmid, NICOGPU_REG_MMU_CTX_ROOT_HI), upper_32_bits(root));
-	xg_wr(x, NICOGPU_BAR_CTRL, ctx_reg(vmid, NICOGPU_REG_MMU_CTX_CTRL), 1);
+	ng_wr(x, NICOGPU_BAR_CTRL, ctx_reg(vmid, NICOGPU_REG_MMU_CTX_ROOT_LO), lower_32_bits(root));
+	ng_wr(x, NICOGPU_BAR_CTRL, ctx_reg(vmid, NICOGPU_REG_MMU_CTX_ROOT_HI), upper_32_bits(root));
+	ng_wr(x, NICOGPU_BAR_CTRL, ctx_reg(vmid, NICOGPU_REG_MMU_CTX_CTRL), 1);
 	return mmu_inval_wait(x, BIT(vmid));
 }
 
 static void ctx_disable(struct nicogpu_dev *x, u32 vmid)
 {
-	xg_wr(x, NICOGPU_BAR_CTRL, ctx_reg(vmid, NICOGPU_REG_MMU_CTX_CTRL), 0);
+	ng_wr(x, NICOGPU_BAR_CTRL, ctx_reg(vmid, NICOGPU_REG_MMU_CTX_CTRL), 0);
 	(void)mmu_inval_wait(x, BIT(vmid));
 }
 
@@ -304,7 +299,7 @@ static bool op_invalidate(void *ctx)
 }
 
 /* The core resolves handles itself, one by one, while it validates; GEM handles can be closed by another thread
- * (DRM_IOCTL_GEM_CLOSE does not take xf->lock) so nicogpu_ioc_vm_bind() looks the BOs of the call up first, with
+ * (DRM_IOCTL_GEM_CLOSE does not take xf->vm_lock) so nicogpu_ioc_vm_bind() looks the BOs of the call up first, with
  * references, into `pin` and the core only reads that table. */
 static int op_bo_lookup(void *ctx, u32 handle, struct xvc_bo_info *out)
 {
@@ -473,7 +468,7 @@ static int bo_alloc_vram(struct nicogpu_dev *x, struct nicogpu_bo *bo, u64 align
 	u64 off, pos = 0;
 	bool ok;
 
-	if (!rm_present(x))
+	if (!ng_rm_present(x))
 		return -EAGAIN;		/* BAR2 is the RM's memory: nothing to clear through */
 	mutex_lock(&m->lock);
 	ok = xvc_pool_alloc(&m->vram, bo->alloc, align, &bo->pa);
@@ -490,7 +485,7 @@ static int bo_alloc_vram(struct nicogpu_dev *x, struct nicogpu_bo *bo, u64 align
 		cond_resched();
 	}
 	wmb();
-	(void)xg_rd(x, NICOGPU_BAR_CTRL, RM_ID);	/* drain the posted clears */
+	(void)ng_rd(x, NICOGPU_BAR_CTRL, RM_ID);	/* drain the posted clears */
 	return 0;
 }
 
@@ -538,69 +533,65 @@ static int bo_alloc_gtt(struct nicogpu_dev *x, struct nicogpu_bo *bo, u64 align,
 	return 0;
 }
 
-long nicogpu_ioc_bo_create(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_bo_create(struct nicogpu_file *xf, void *data)
 {
 	struct nicogpu_dev *x = xf->x;
-	struct nicogpu_bo_create a;
+	struct nicogpu_bo_create *a = data;
 	struct nicogpu_bo *bo;
 	u64 size, align;
 	u32 handle = 0;
 	bool mappable;
 	int rc;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.pad)
+	if (a->pad)
 		return -EINVAL;
-	rc = xvc_bo_args_check(a.size, a.alignment, a.domain, a.flags, &size, &align);
+	rc = xvc_bo_args_check(a->size, a->alignment, a->domain, a->flags, &size, &align);
 	if (rc)
 		return rc;
-	if (a.domain == NICOGPU_BO_DOMAIN_VRAM && !xgi_rm_kind_has_vram(nicogpu_rm_kind(x)))
+	if (a->domain == NICOGPU_BO_DOMAIN_VRAM && !ngi_rm_kind_has_vram(nicogpu_rm_kind(x)))
 		return -EOPNOTSUPP;	/* GET_GPU_INFO.info_flags has NICOGPU_GPU_INFO_F_NO_VRAM: the loaded RM has no VRAM path */
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL_ACCOUNT);
 	if (!bo)
 		return -ENOMEM;
 	bo->size = size;
 	bo->alloc = PAGE_ALIGN(size);
-	bo->domain = a.domain;
-	bo->flags = a.flags;
+	bo->domain = a->domain;
+	bo->flags = a->flags;
 	mappable = bo_mappable(bo);
 	drm_gem_private_object_init(&x->drm, &bo->base, bo->alloc);	/* no shmem backing: our own allocators */
 	bo->base.funcs = &nicogpu_gem_funcs;
 	if (align < PAGE_SIZE)
 		align = PAGE_SIZE;	/* no BO shares a host page with another */
-	rc = a.domain == NICOGPU_BO_DOMAIN_VRAM ? bo_alloc_vram(x, bo, align) : bo_alloc_gtt(x, bo, align, a.alignment != 0);
+	rc = a->domain == NICOGPU_BO_DOMAIN_VRAM ? bo_alloc_vram(x, bo, align) : bo_alloc_gtt(x, bo, align, a->alignment != 0);
 	if (!rc && mappable)
 		rc = drm_gem_create_mmap_offset(&bo->base);
 	if (!rc)
 		rc = drm_gem_handle_create(xf->file, &bo->base, &handle);	/* the handle holds its own reference */
 	if (!rc) {
-		a.size = size;
-		a.handle = handle;
-		a.mmap_offset = mappable ? drm_vma_node_offset_addr(&bo->base.vma_node) : 0;
+		a->size = size;
+		a->handle = handle;
+		a->mmap_offset = mappable ? drm_vma_node_offset_addr(&bo->base.vma_node) : 0;
 	}
 	drm_gem_object_put(&bo->base);	/* the creation reference; on failure this frees the BO */
 	if (rc)
 		return rc == -ENOSPC ? -ENOMEM : rc;	/* -ENOSPC is reserved for "no handle / mapping limit" in the UAPI */
-	return nicogpu_arg_out(up, &a, sizeof(a));
+	return 0;
 }
 
-long nicogpu_ioc_bo_free(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_bo_free(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_bo_free a;
+	struct nicogpu_bo_free *a = data;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.pad)
+	if (a->pad)
 		return -EINVAL;
 	/* VM mappings and vmas keep the storage alive until they go away; drm_gem_handle_delete() says -EINVAL for an
 	 * unknown handle, the UAPI says -ENOENT */
-	return drm_gem_handle_delete(xf->file, a.handle) ? -ENOENT : 0;
+	return drm_gem_handle_delete(xf->file, a->handle) ? -ENOENT : 0;
 }
 
 /* ---- VMs ---------------------------------------------------------------- */
 
-/* caller holds xf->lock; takes bind_lock */
+/* caller holds xf->vm_lock; takes bind_lock, then xf->lock to publish the VM */
 static int vm_create_locked(struct nicogpu_file *xf, struct nicogpu_vm_create *a)
 {
 	struct nicogpu_dev *x = xf->x;
@@ -655,24 +646,34 @@ static int vm_create_locked(struct nicogpu_file *xf, struct nicogpu_vm_create *a
 		kfree(v);
 		return rc;
 	}
+	mutex_lock(&xf->lock);
 	xf->vms[vmid] = v;
+	mutex_unlock(&xf->lock);
 	a->vm_id = vmid;
 	a->status = v->hw ? 0 : NICOGPU_VM_STATUS_SHADOW_ONLY;
 	return 0;
 }
 
-/* caller holds xf->lock.  `mmio`: the device may still be programmed. */
+/* Take the VM out of xf->vms[] (caller holds xf->vm_lock): from here no ioctl of the file can find it.  The caller
+ * has checked under the same xf->lock section that no queue is bound to it, if that matters. */
+static void vm_unpublish(struct nicogpu_file *xf, struct nicogpu_vm *v)
+{
+	mutex_lock(&xf->lock);
+	xf->vms[v->vmid] = NULL;
+	mutex_unlock(&xf->lock);
+}
+
+/* caller holds xf->vm_lock; `v` is unpublished (vm_unpublish).  `mmio`: the device may still be programmed. */
 static void vm_destroy_locked(struct nicogpu_file *xf, struct nicogpu_vm *v, bool mmio)
 {
 	struct nicogpu_mm *m = &xf->x->mm;
 
 	mutex_lock(&m->bind_lock);
-	if (v->hw && mmio && rm_present(xf->x))
+	if (v->hw && mmio && ng_rm_present(xf->x))
 		ctx_disable(xf->x, v->vmid);
 	m->ctx_root[v->vmid] = 0;
 	xvc_vm_fini(&v->core);
 	mutex_unlock(&m->bind_lock);
-	xf->vms[v->vmid] = NULL;
 	mutex_lock(&m->lock);
 	clear_bit(v->vmid, &m->vmid_map);
 	mutex_unlock(&m->lock);
@@ -685,46 +686,48 @@ static struct nicogpu_vm *vm_get(struct nicogpu_file *xf, u32 vmid)
 	return vmid > 0 && vmid < NICOGPU_NUM_VMIDS ? xf->vms[vmid] : NULL;
 }
 
-long nicogpu_ioc_vm_create(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_vm_create(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_vm_create a;
+	struct nicogpu_vm_create *a = data;
 	int rc;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.flags || a.pad)
+	if (a->flags || a->pad)
 		return -EINVAL;
-	mutex_lock(&xf->lock);
-	rc = vm_create_locked(xf, &a);
-	mutex_unlock(&xf->lock);
-	if (!rc)
-		nicogpu_arg_out(up, &a, sizeof(a));
+	mutex_lock(&xf->vm_lock);
+	rc = vm_create_locked(xf, a);
+	mutex_unlock(&xf->vm_lock);
 	return rc;
 }
 
-long nicogpu_ioc_vm_destroy(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_vm_destroy(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_vm_destroy a;
+	struct nicogpu_vm_destroy *a = data;
 	struct nicogpu_vm *v;
 	long rc = 0;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.pad)
+	if (a->pad)
 		return -EINVAL;
-	mutex_lock(&xf->lock);
-	v = vm_get(xf, a.vm_id);
-	if (!v)
+	mutex_lock(&xf->vm_lock);
+	v = vm_get(xf, a->vm_id);
+	if (!v) {
 		rc = -ENOENT;
-	else if (nicogpu_sched_vm_in_use(xf, a.vm_id))
-		rc = -EBUSY;		/* no queue may reference a VM being destroyed */
-	else
-		vm_destroy_locked(xf, v, true);
-	mutex_unlock(&xf->lock);
+	} else {
+		/* the in-use check and the unpublish in one xf->lock section: QUEUE_CREATE (xf->lock) either sees the VM
+		 * gone or made it busy */
+		mutex_lock(&xf->lock);
+		if (nicogpu_sched_vm_in_use(xf, a->vm_id))
+			rc = -EBUSY;	/* no queue may reference a VM being destroyed */
+		else
+			xf->vms[v->vmid] = NULL;
+		mutex_unlock(&xf->lock);
+		if (!rc)
+			vm_destroy_locked(xf, v, true);	/* slow (TLB wait): submits of the file are not blocked */
+	}
+	mutex_unlock(&xf->vm_lock);
 	return rc;
 }
 
-/* Resolve the MAP BOs of one VM_BIND call into v->pin, holding a reference each (xf->lock held).  Handles that do not
+/* Resolve the MAP BOs of one VM_BIND call into v->pin, holding a reference each (xf->vm_lock held).  Handles that do not
  * exist are simply absent: the core reports -ENOENT at the right place of its validation order. */
 static void vm_bind_unpin(struct nicogpu_vm *v)
 {
@@ -758,35 +761,33 @@ static int vm_bind_pin(struct nicogpu_vm *v, const struct xvc_bind_op *ops, u32 
 	return 0;
 }
 
-long nicogpu_ioc_vm_bind(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_vm_bind(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_vm_bind a;
+	struct nicogpu_vm_bind *a = data;
 	struct xvc_bind_op *ops = NULL;
 	struct nicogpu_vm *v;
 	struct nicogpu_mm *m = &xf->x->mm;
 	long rc;
 
 	BUILD_BUG_ON(sizeof(struct nicogpu_vm_bind_op) != sizeof(struct xvc_bind_op));
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.flags || a.pad || a.num_ops > NICOGPU_VM_BIND_MAX_OPS)
+	if (a->flags || a->pad || a->num_ops > NICOGPU_VM_BIND_MAX_OPS)
 		return -EINVAL;
-	if (a.num_ops) {
-		ops = kvmalloc_array(a.num_ops, sizeof(*ops), GFP_KERNEL_ACCOUNT);
+	if (a->num_ops) {
+		ops = kvmalloc_array(a->num_ops, sizeof(*ops), GFP_KERNEL_ACCOUNT);
 		if (!ops)
 			return -ENOMEM;
-		if (copy_from_user(ops, u64_to_user_ptr(a.ops), (size_t)a.num_ops * sizeof(*ops))) {
+		if (copy_from_user(ops, u64_to_user_ptr(a->ops), (size_t)a->num_ops * sizeof(*ops))) {
 			kvfree(ops);
 			return -EFAULT;
 		}
 	}
-	mutex_lock(&xf->lock);
-	v = vm_get(xf, a.vm_id);
+	mutex_lock(&xf->vm_lock);	/* not xf->lock: a bind must not stall the file's submits */
+	v = vm_get(xf, a->vm_id);
 	if (!v) {
 		rc = -ENOENT;
 		goto out;
 	}
-	rc = vm_bind_pin(v, ops, a.num_ops);
+	rc = vm_bind_pin(v, ops, a->num_ops);
 	if (rc)
 		goto out;
 	mutex_lock(&m->bind_lock);
@@ -795,7 +796,7 @@ long nicogpu_ioc_vm_bind(struct nicogpu_file *xf, void *up)
 		rc = -EIO;
 	} else {
 		m->io_err = false;
-		rc = xvc_vm_bind(&v->core, ops, a.num_ops);
+		rc = xvc_vm_bind(&v->core, ops, a->num_ops);
 		if (m->io_err) {
 			/* a slide was rejected: some page-table stores went to the
 			 * wrong place; atomicity cannot be promised any more */
@@ -808,39 +809,37 @@ long nicogpu_ioc_vm_bind(struct nicogpu_file *xf, void *up)
 	mutex_unlock(&m->bind_lock);
 	vm_bind_unpin(v);
 out:
-	mutex_unlock(&xf->lock);
+	mutex_unlock(&xf->vm_lock);
 	kvfree(ops);
 	return rc;
 }
 
-long nicogpu_ioc_vm_lookup(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_vm_lookup(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_vm_lookup a;
+	struct nicogpu_vm_lookup *a = data;
 	struct xvc_xlate t;
 	struct nicogpu_vm *v;
 	long rc = 0;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.pad)
+	if (a->pad)
 		return -EINVAL;
-	mutex_lock(&xf->lock);
-	v = vm_get(xf, a.vm_id);
+	mutex_lock(&xf->vm_lock);
+	v = vm_get(xf, a->vm_id);
 	if (v)
-		xvc_vm_lookup(&v->core, a.va, &t);
+		xvc_vm_lookup(&v->core, a->va, &t);
 	else
 		rc = -ENOENT;
-	mutex_unlock(&xf->lock);
+	mutex_unlock(&xf->vm_lock);
 	if (rc)
 		return rc;
-	a.kind = t.kind;
-	a.level = t.level;
-	a.entry = t.entry;
-	a.pa = t.pa;
-	a.page_size = t.page_size;
-	return nicogpu_arg_out(up, &a, sizeof(a));
+	a->kind = t.kind;
+	a->level = t.level;
+	a->entry = t.entry;
+	a->pa = t.pa;
+	a->page_size = t.page_size;
+	return 0;
 }
 
 /* ---- mmap of BOs -------------------------------------------------------- */
@@ -887,7 +886,7 @@ bool nicogpu_mm_bar2_user_ok(struct nicogpu_dev *x, u64 off, u64 len)
 }
 
 /* GET_GPU_INFO inputs that only the allocator knows */
-void nicogpu_mm_fill_hw(struct nicogpu_dev *x, struct xgi_hw *hw)
+void nicogpu_mm_fill_hw(struct nicogpu_dev *x, struct ngi_hw *hw)
 {
 	struct nicogpu_mm *m = &x->mm;
 
@@ -908,6 +907,7 @@ void nicogpu_mm_fill_hw(struct nicogpu_dev *x, struct xgi_hw *hw)
 
 int nicogpu_mm_open(struct nicogpu_file *xf)
 {
+	mutex_init(&xf->vm_lock);
 	mutex_init(&xf->lock);
 	nicogpu_sched_open(xf);		/* queue / syncobj tables */
 	INIT_LIST_HEAD(&xf->node);
@@ -925,11 +925,16 @@ static void file_teardown(struct nicogpu_file *xf, bool mmio)
 
 	/* queues first: their jobs run in the VMs and touch the BOs below */
 	nicogpu_sched_file_fini(xf);
-	mutex_lock(&xf->lock);
-	for (i = 1; i < NICOGPU_NUM_VMIDS; i++)
-		if (xf->vms[i])
-			vm_destroy_locked(xf, xf->vms[i], mmio);
-	mutex_unlock(&xf->lock);
+	mutex_lock(&xf->vm_lock);
+	for (i = 1; i < NICOGPU_NUM_VMIDS; i++) {
+		struct nicogpu_vm *v = xf->vms[i];
+
+		if (v) {
+			vm_unpublish(xf, v);
+			vm_destroy_locked(xf, v, mmio);
+		}
+	}
+	mutex_unlock(&xf->vm_lock);
 	xf->torn = true;
 }
 
@@ -943,7 +948,7 @@ void nicogpu_mm_release(struct nicogpu_file *xf)
 	mutex_unlock(&nicogpu_files_lock);
 }
 
-/* remove(): after drm_dev_unplug() (no ioctl is running or can start) and `dead` set, device still programmable.
+/* remove(): after drm_dev_unplug() (no ioctl is running or can start), device still programmable.
  * Tears down the queues and VMs the open files still own, so no VM outlives the pools; their BOs are dropped by the
  * DRM core when the files are closed (nicogpu_gem_free() copes with a dead device), their CPU mappings were zapped by
  * remove(). */
@@ -963,7 +968,7 @@ void nicogpu_mm_remove_files(struct nicogpu_dev *x)
 
 /* ---- C3 front region (ring / firmware) ---------------------------- */
 
-/* Make sure the C3 window is open.  The
+/* The kernel half of the C3 discipline: make sure the C3 window is open.  The
  * ring lives in C3 [0, 16 MiB), below the page-table pool. */
 int nicogpu_mm_c3_open(struct nicogpu_dev *x)
 {
@@ -1044,8 +1049,8 @@ int nicogpu_mm_c3_write(struct nicogpu_dev *x, u64 off, const u32 *dw, u32 n)
 	mutex_lock(&m->bind_lock);
 	if (!m->win_on || !win_alive(x)) {
 		dev_err(&x->pdev->dev, "C3 ring write failed: win_on %d, C3_WIN_CTRL %08x, C3_WIN_BASE %08x, RM_STATUS %08x\n",
-			m->win_on, xg_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL), xg_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_BASE),
-			xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS));
+			m->win_on, ng_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL), ng_rd(x, NICOGPU_BAR_CTRL, RM_C3_WIN_BASE),
+			ng_rd(x, NICOGPU_BAR_SHELL, RM_STATUS));
 		rc = -EIO;		/* RM replaced / reset: the ring is gone */
 	} else {
 		m->io_err = false;
@@ -1098,8 +1103,8 @@ void nicogpu_mm_fini(struct nicogpu_dev *x)
 {
 	struct nicogpu_mm *m = &x->mm;
 
-	if (m->win_on && rm_present(x))
-		xg_wr(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL, 0);	/* BAR2 back to identity */
+	if (m->win_on && ng_rm_present(x))
+		ng_wr(x, NICOGPU_BAR_CTRL, RM_C3_WIN_CTRL, 0);	/* BAR2 back to identity */
 	m->win_on = false;
 	mutex_lock(&m->lock);			/* nicogpu_gem_free() of a BO that outlived the device looks at vram_bits */
 	kvfree(m->vram_bits);

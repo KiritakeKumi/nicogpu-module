@@ -6,10 +6,10 @@
 //     the dma_fence adapter), per-open nicogpu_file in drm_file::driver_priv;
 //   * the ioctl table: every ioctl of ABI v1..v3 keeps its number as DRM_COMMAND_BASE + DRM_NICOGPU_* (nicogpu_uapi.h);
 //     the handlers live next to their state (nicogpu_mm.c, nicogpu_sched.c, nicogpu_dfx.c);
-//   * the debug facilities of the first skeleton that must not be reachable by every user of a render node: BAR mmaps,
+//   * the debug facilities of the skeleton that must not be reachable by every user of a render node: BAR mmaps,
 //     the DMA buffer, PTEATTR, KTEST -- DRM_ROOT_ONLY ioctls / CAP_SYS_ADMIN mmaps;
 //   * file operations: drm_gem_mmap() for BO mappings (DRM fake offsets >= 4 GiB), the debug BAR/DMA mappings below.
-// ABI in nicogpu_uapi.h.
+// p0test semantics folded in; ABI in nicogpu_uapi.h.
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
@@ -66,22 +66,20 @@ void nicogpu_dma_free(struct nicogpu_dev *x)
 	mutex_unlock(&x->dbuf_lock);
 }
 
-static long ioc_dmabuf(struct nicogpu_file *xf, void *up)
+static long ioc_dmabuf(struct nicogpu_file *xf, void *data)
 {
 	struct nicogpu_dev *x = xf->x;
-	struct nicogpu_dmabuf a;
+	struct nicogpu_dmabuf *a = data;
 	long rc = 0;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (!a.size || a.size > DMABUF_MAX)
+	if (!a->size || a->size > DMABUF_MAX)
 		return -EINVAL;
 	mutex_lock(&x->dbuf_lock);
 	if (x->dbuf_cpu) {
 		rc = -EBUSY;
 		goto out;
 	}
-	x->dbuf_size = PAGE_ALIGN(a.size);
+	x->dbuf_size = PAGE_ALIGN(a->size);
 	x->dbuf_cpu = dma_alloc_coherent(&x->pdev->dev, x->dbuf_size, &x->dbuf_iova, GFP_KERNEL);
 	if (!x->dbuf_cpu) {
 		x->dbuf_size = 0;
@@ -89,16 +87,15 @@ static long ioc_dmabuf(struct nicogpu_file *xf, void *up)
 		goto out;
 	}
 	x->dbuf_owner = xf->file;
-	a.size = x->dbuf_size;
-	a.iova = x->dbuf_iova;
+	a->size = x->dbuf_size;
+	a->iova = x->dbuf_iova;
 	dev_info(&x->pdev->dev, "DMABUF size=%zu iova=0x%llx\n", x->dbuf_size, (u64)x->dbuf_iova);
-	nicogpu_arg_out(up, &a, sizeof(a));
 out:
 	mutex_unlock(&x->dbuf_lock);
 	return rc;
 }
 
-static long ioc_dmafree(struct nicogpu_file *xf, void *up)
+static long ioc_dmafree(struct nicogpu_file *xf, void *data)
 {
 	struct nicogpu_dev *x = xf->x;
 	long rc = 0;
@@ -192,40 +189,38 @@ out:
 static int nicogpu_drm_mmap(struct file *f, struct vm_area_struct *vma)
 {
 	if (vma->vm_pgoff >= DRM_FILE_PAGE_OFFSET_START)
-		return drm_gem_mmap(f, vma);	/* a BO: access check per file, funcs->mmap = nicogpu_gem_mmap() */
+		return drm_gem_mmap(f, vma);	/* a BO: access check per file, funcs->mmap = nicogpu_gem_mmap */
 	return nicogpu_debug_mmap(f, vma);
 }
 
 /* ---- debug ioctls (DRM_ROOT_ONLY) ---- */
-static long ioc_pteattr(struct nicogpu_file *xf, void *up)
+static long ioc_pteattr(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_pteattr a;
+	struct nicogpu_pteattr *a = data;
 	struct follow_pfnmap_args args = { };
 	struct mm_struct *mm = current->mm;
 	int rc;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
 	mmap_read_lock(mm);
-	args.vma = vma_lookup(mm, a.va);
-	args.address = a.va;
+	args.vma = vma_lookup(mm, a->va);
+	args.address = a->va;
 	rc = args.vma ? follow_pfnmap_start(&args) : -EFAULT;
 	if (!rc) {
-		a.pfn = args.pfn;
-		a.prot = pgprot_val(args.pgprot);
+		a->pfn = args.pfn;
+		a->prot = pgprot_val(args.pgprot);
 		follow_pfnmap_end(&args);
 	}
 	mmap_read_unlock(mm);
 	if (rc)
 		return rc;
 #ifdef CONFIG_ARM64
-	a.attrindx = (a.prot & PTE_ATTRINDX_MASK) >> 2;
-	a.mair = (read_sysreg(mair_el1) >> (8 * a.attrindx)) & 0xFF;
+	a->attrindx = (a->prot & PTE_ATTRINDX_MASK) >> 2;
+	a->mair = (read_sysreg(mair_el1) >> (8 * a->attrindx)) & 0xFF;
 #else
-	a.attrindx = 0xFF;
-	a.mair = 0xFF;
+	a->attrindx = 0xFF;
+	a->mair = 0xFF;
 #endif
-	return nicogpu_arg_out(up, &a, sizeof(a));
+	return 0;
 }
 
 static u32 lane_expect(u32 off, u32 len, const unsigned char *pat)
@@ -242,7 +237,7 @@ static u32 lane_expect(u32 off, u32 len, const unsigned char *pat)
 }
 
 // Driver rule: ioremap_wc + memcpy_toio/memset_io.
-static long ioc_ktest(struct nicogpu_file *xf, void *up)
+static long ioc_ktest(struct nicogpu_file *xf, void *data)
 {
 	static const unsigned int lens[] = { 1, 2, 3, 4, 5, 7, 8, 15, 64, 4095 };
 	struct nicogpu_dev *x = xf->x;
@@ -251,7 +246,7 @@ static long ioc_ktest(struct nicogpu_file *xf, void *up)
 	unsigned char *src;
 	unsigned int off, i, len;
 
-	if (xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS) & RM_ST_DECOUPLED)
+	if (!ng_rm_present(x))
 		return -EAGAIN;
 	src = kmalloc(8192, GFP_KERNEL);
 	wc2 = ioremap_wc(pci_resource_start(x->pdev, NICOGPU_BAR_MEM), 16384);
@@ -280,10 +275,10 @@ static long ioc_ktest(struct nicogpu_file *xf, void *up)
 			const unsigned char *pat = src + t.lane_cases % 4096;
 			u32 got, want = lane_expect(off, len, pat);
 
-			xg_wr(x, NICOGPU_BAR_CTRL, RM_SCRATCH, NICOGPU_SCRATCH_INIT);
+			ng_wr(x, NICOGPU_BAR_CTRL, RM_SCRATCH, NICOGPU_SCRATCH_INIT);
 			memcpy_toio(wc0 + off, pat, len);
 			wmb();
-			got = xg_rd(x, NICOGPU_BAR_CTRL, RM_SCRATCH);
+			got = ng_rd(x, NICOGPU_BAR_CTRL, RM_SCRATCH);
 			if (got != want && t.lane_fail++ == 0) {
 				t.first_off = off;
 				t.first_len = len;
@@ -298,7 +293,8 @@ static long ioc_ktest(struct nicogpu_file *xf, void *up)
 	kfree(src);
 	dev_info(&x->pdev->dev, "KTEST bar2_ops=%u lane_cases=%u lane_fail=%u\n",
 		 t.bar2_ops, t.lane_cases, t.lane_fail);
-	return nicogpu_arg_out(up, &t, sizeof(t));
+	*(struct nicogpu_ktest *)data = t;
+	return 0;
 }
 
 static long ioc_get_info(struct nicogpu_file *xf, void *data)
@@ -321,16 +317,17 @@ static long ioc_get_info(struct nicogpu_file *xf, void *data)
 		atomic_andnot(i.irq_shell_latched, &x->irq_shell_latched);
 		atomic_andnot(i.irq_rm_latched, &x->irq_rm_latched);
 	}
-	return nicogpu_arg_out(data, &i, sizeof(i));
+	*(struct nicogpu_info *)data = i;
+	return 0;
 }
 
 /* ---- ABI v5: GET_GPU_INFO / GET_TIMESTAMP ---- */
 
-static_assert(NICOGPU_GPU_INFO_F_RM_CAPS == XGI_F_RM_CAPS && NICOGPU_GPU_INFO_F_RM_REV == XGI_F_RM_REV &&
-	      NICOGPU_GPU_INFO_F_TS_RM == XGI_F_TS_RM && NICOGPU_GPU_INFO_F_TS_SHELL == XGI_F_TS_SHELL && NICOGPU_GPU_INFO_F_GTT_UNCACHED == XGI_F_GTT_UNCACHED &&
-	      NICOGPU_GPU_INFO_F_NO_VRAM == XGI_F_NO_VRAM && NICOGPU_GPU_INFO_F_SP_UNITS == XGI_F_SP_UNITS &&
-	      NICOGPU_SP_UNIT_SFU == XGI_SPU_SFU && NICOGPU_SP_UNIT_XLANE == XGI_SPU_XLANE && NICOGPU_SP_UNIT_FP64 == XGI_SPU_FP64 &&
-	      NICOGPU_SP_UNIT_F16CVT == XGI_SPU_F16CVT,
+static_assert(NICOGPU_GPU_INFO_F_RM_CAPS == NGI_F_RM_CAPS && NICOGPU_GPU_INFO_F_RM_REV == NGI_F_RM_REV &&
+	      NICOGPU_GPU_INFO_F_TS_RM == NGI_F_TS_RM && NICOGPU_GPU_INFO_F_TS_SHELL == NGI_F_TS_SHELL && NICOGPU_GPU_INFO_F_GTT_UNCACHED == NGI_F_GTT_UNCACHED &&
+	      NICOGPU_GPU_INFO_F_NO_VRAM == NGI_F_NO_VRAM && NICOGPU_GPU_INFO_F_SP_UNITS == NGI_F_SP_UNITS &&
+	      NICOGPU_SP_UNIT_SFU == NGI_SPU_SFU && NICOGPU_SP_UNIT_XLANE == NGI_SPU_XLANE && NICOGPU_SP_UNIT_FP64 == NGI_SPU_FP64 &&
+	      NICOGPU_SP_UNIT_F16CVT == NGI_SPU_F16CVT,
 	      "GPU info flags");
 
 #define NICOGPU_FEATURES_V6 (NICOGPU_FEAT_GPU_INFO | NICOGPU_FEAT_TIMESTAMP | NICOGPU_FEAT_SYNCOBJ_WAIT_AVAILABLE | \
@@ -339,17 +336,17 @@ static_assert(NICOGPU_GPU_INFO_F_RM_CAPS == XGI_F_RM_CAPS && NICOGPU_GPU_INFO_F_
 			  NICOGPU_FEAT_SYNC_FILE)
 
 /* The RM's own register map (CAPS / REV / TIMESTAMP_*) is only there when the RM is coupled and identifies as the GPU
- * RM: the blank / test RMs of the board have other registers at these offsets (the register map is PROVISIONAL). */
+ * RM: the blank / test RMs of the board have other registers at these offsets. */
 static bool rm_regs_ok(struct nicogpu_dev *x)
 {
-	if (xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS) & RM_ST_DECOUPLED)
+	if (!ng_rm_present(x))
 		return false;
-	return xg_rd(x, NICOGPU_BAR_CTRL, RM_ID) == RM_ID_MAGIC;
+	return ng_rm_id_ok(ng_rd(x, NICOGPU_BAR_CTRL, RM_ID));
 }
 
 static u32 shell_ts_khz(struct nicogpu_dev *x)
 {
-	return (xg_rd(x, NICOGPU_BAR_SHELL, SH_VERSION) & 0xFFFF) >= 2 ? xg_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_TS) : 0;
+	return (ng_rd(x, NICOGPU_BAR_SHELL, SH_VERSION) & 0xFFFF) >= 2 ? ng_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_TS) : 0;
 }
 
 static long ioc_get_gpu_info(struct nicogpu_file *xf, void *data)
@@ -357,8 +354,8 @@ static long ioc_get_gpu_info(struct nicogpu_file *xf, void *data)
 	struct nicogpu_dev *x = xf->x;
 	const struct nicogpu_gpu_info *in = data;
 	struct nicogpu_gpu_info i = { };
-	struct xgi_hw hw = { };
-	struct xgi_info o;
+	struct ngi_hw hw = { };
+	struct ngi_info o;
 	int k;
 
 	if (in->struct_size != sizeof(i) || in->flags)
@@ -370,14 +367,14 @@ static long ioc_get_gpu_info(struct nicogpu_file *xf, void *data)
 			return -EINVAL;
 	hw.rm_regs = rm_regs_ok(x);
 	if (hw.rm_regs) {
-		hw.rm_rev = xg_rd(x, NICOGPU_BAR_CTRL, RM_REV);
-		hw.rm_caps = xg_rd(x, NICOGPU_BAR_CTRL, RM_CAPS);
-		hw.rm_ts_freq_hz = xg_rd(x, NICOGPU_BAR_CTRL, RM_TIMESTAMP_FREQ);
+		hw.rm_rev = ng_rd(x, NICOGPU_BAR_CTRL, RM_REV);
+		hw.rm_caps = ng_rd(x, NICOGPU_BAR_CTRL, RM_CAPS);
+		hw.rm_ts_freq_hz = ng_rd(x, NICOGPU_BAR_CTRL, RM_TIMESTAMP_FREQ);
 	}
 	hw.rm_kind = nicogpu_rm_kind(x);
 	hw.shell_ts_khz = shell_ts_khz(x);
 	nicogpu_mm_fill_hw(x, &hw);
-	xgi_build(&hw, &o);
+	ngi_build(&hw, &o);
 
 	i.struct_size = sizeof(i);
 	i.abi_version = NICOGPU_ABI_VERSION;
@@ -411,7 +408,8 @@ static long ioc_get_gpu_info(struct nicogpu_file *xf, void *data)
 	i.vram_used = o.vram_used;
 	i.gtt_used = o.gtt_used;
 	i.timestamp_freq_hz = o.timestamp_freq_hz;
-	return nicogpu_arg_out(data, &i, sizeof(i));
+	*(struct nicogpu_gpu_info *)data = i;
+	return 0;
 }
 
 static long ioc_get_timestamp(struct nicogpu_file *xf, void *data)
@@ -419,7 +417,7 @@ static long ioc_get_timestamp(struct nicogpu_file *xf, void *data)
 	struct nicogpu_dev *x = xf->x;
 	const struct nicogpu_timestamp *in = data;
 	struct nicogpu_timestamp t = { };
-	struct xgi_hw hw = { };
+	struct ngi_hw hw = { };
 	u32 lo, hi, src;
 	bool raw;
 	long rc = 0;
@@ -433,31 +431,32 @@ static long ioc_get_timestamp(struct nicogpu_file *xf, void *data)
 		goto out;
 	}
 	t.cpu_ns_before = raw ? ktime_get_raw_ns() : ktime_get_ns();
-	lo = xg_rd(x, NICOGPU_BAR_CTRL, RM_TIMESTAMP_LO);	/* latches HI */
-	hi = xg_rd(x, NICOGPU_BAR_CTRL, RM_TIMESTAMP_HI);
+	lo = ng_rd(x, NICOGPU_BAR_CTRL, RM_TIMESTAMP_LO);	/* latches HI */
+	hi = ng_rd(x, NICOGPU_BAR_CTRL, RM_TIMESTAMP_HI);
 	hw.rm_regs = true;
-	hw.rm_ts_freq_hz = xg_rd(x, NICOGPU_BAR_CTRL, RM_TIMESTAMP_FREQ);
+	hw.rm_ts_freq_hz = ng_rd(x, NICOGPU_BAR_CTRL, RM_TIMESTAMP_FREQ);
 	t.cpu_ns_after = raw ? ktime_get_raw_ns() : ktime_get_ns();
 	/* the RM was isolated / replaced while we read (all-ones, or DECOUPLED now): the pair is not a timestamp */
-	if ((lo == 0xFFFFFFFFu && hi == 0xFFFFFFFFu) || (xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS) & RM_ST_DECOUPLED)) {
+	if ((lo == 0xFFFFFFFFu && hi == 0xFFFFFFFFu) || !ng_rm_present(x)) {
 		rc = -EAGAIN;
 		goto out;
 	}
 	hw.shell_ts_khz = shell_ts_khz(x);
-	t.ts = xgi_ts_join(lo, hi);
-	t.freq_hz = xgi_ts_freq(&hw, &src);
+	t.ts = ngi_ts_join(lo, hi);
+	t.freq_hz = ngi_ts_freq(&hw, &src);
 out:
 	mutex_unlock(&x->ts_lock);
 	if (rc)
 		return rc;
-	return nicogpu_arg_out(data, &t, sizeof(t));
+	*(struct nicogpu_timestamp *)data = t;
+	return 0;
 }
 
 /* ---- the ioctl table ---- */
 
 /* Every handler runs between drm_dev_enter() and drm_dev_exit(): remove() calls drm_dev_unplug(), which waits for the
  * ones in flight and makes later calls fail with -ENODEV before the device state is torn down. */
-#define XG_IOCTL(name, handler)								\
+#define NG_IOCTL(name, handler)								\
 static int nicogpu_drm_##name(struct drm_device *dev, void *data, struct drm_file *file)	\
 {											\
 	int idx;									\
@@ -470,66 +469,66 @@ static int nicogpu_drm_##name(struct drm_device *dev, void *data, struct drm_fil
 	return rc;									\
 }
 
-XG_IOCTL(PTEATTR, ioc_pteattr)
-XG_IOCTL(KTEST, ioc_ktest)
-XG_IOCTL(DMABUF, ioc_dmabuf)
-XG_IOCTL(DMAFREE, ioc_dmafree)
-XG_IOCTL(GET_INFO, ioc_get_info)
-XG_IOCTL(GET_GPU_INFO, ioc_get_gpu_info)
-XG_IOCTL(GET_TIMESTAMP, ioc_get_timestamp)
-XG_IOCTL(GET_DEV_STATUS, nicogpu_ioc_dev_status)
-XG_IOCTL(BO_CREATE, nicogpu_ioc_bo_create)
-XG_IOCTL(BO_FREE, nicogpu_ioc_bo_free)
-XG_IOCTL(VM_CREATE, nicogpu_ioc_vm_create)
-XG_IOCTL(VM_DESTROY, nicogpu_ioc_vm_destroy)
-XG_IOCTL(VM_BIND, nicogpu_ioc_vm_bind)
-XG_IOCTL(VM_LOOKUP, nicogpu_ioc_vm_lookup)
-XG_IOCTL(QUEUE_CREATE, nicogpu_ioc_queue_create)
-XG_IOCTL(QUEUE_DESTROY, nicogpu_ioc_queue_destroy)
-XG_IOCTL(QUEUE_STATUS, nicogpu_ioc_queue_status)
-XG_IOCTL(SYNCOBJ_CREATE, nicogpu_ioc_syncobj_create)
-XG_IOCTL(SYNCOBJ_DESTROY, nicogpu_ioc_syncobj_destroy)
-XG_IOCTL(SYNCOBJ_RESET, nicogpu_ioc_syncobj_reset)
-XG_IOCTL(SYNCOBJ_SIGNAL, nicogpu_ioc_syncobj_signal)
-XG_IOCTL(SYNCOBJ_WAIT, nicogpu_ioc_syncobj_wait)
-XG_IOCTL(SUBMIT, nicogpu_ioc_submit)
-XG_IOCTL(FENCE_WAIT, nicogpu_ioc_fence_wait)
-XG_IOCTL(QUEUE_FAULT, nicogpu_ioc_queue_fault)
-XG_IOCTL(PR_LOAD, nicogpu_ioc_pr_load)
-XG_IOCTL(RESET, nicogpu_ioc_reset)
+NG_IOCTL(PTEATTR, ioc_pteattr)
+NG_IOCTL(KTEST, ioc_ktest)
+NG_IOCTL(DMABUF, ioc_dmabuf)
+NG_IOCTL(DMAFREE, ioc_dmafree)
+NG_IOCTL(GET_INFO, ioc_get_info)
+NG_IOCTL(GET_GPU_INFO, ioc_get_gpu_info)
+NG_IOCTL(GET_TIMESTAMP, ioc_get_timestamp)
+NG_IOCTL(GET_DEV_STATUS, nicogpu_ioc_dev_status)
+NG_IOCTL(BO_CREATE, nicogpu_ioc_bo_create)
+NG_IOCTL(BO_FREE, nicogpu_ioc_bo_free)
+NG_IOCTL(VM_CREATE, nicogpu_ioc_vm_create)
+NG_IOCTL(VM_DESTROY, nicogpu_ioc_vm_destroy)
+NG_IOCTL(VM_BIND, nicogpu_ioc_vm_bind)
+NG_IOCTL(VM_LOOKUP, nicogpu_ioc_vm_lookup)
+NG_IOCTL(QUEUE_CREATE, nicogpu_ioc_queue_create)
+NG_IOCTL(QUEUE_DESTROY, nicogpu_ioc_queue_destroy)
+NG_IOCTL(QUEUE_STATUS, nicogpu_ioc_queue_status)
+NG_IOCTL(SYNCOBJ_CREATE, nicogpu_ioc_syncobj_create)
+NG_IOCTL(SYNCOBJ_DESTROY, nicogpu_ioc_syncobj_destroy)
+NG_IOCTL(SYNCOBJ_RESET, nicogpu_ioc_syncobj_reset)
+NG_IOCTL(SYNCOBJ_SIGNAL, nicogpu_ioc_syncobj_signal)
+NG_IOCTL(SYNCOBJ_WAIT, nicogpu_ioc_syncobj_wait)
+NG_IOCTL(SUBMIT, nicogpu_ioc_submit)
+NG_IOCTL(FENCE_WAIT, nicogpu_ioc_fence_wait)
+NG_IOCTL(QUEUE_FAULT, nicogpu_ioc_queue_fault)
+NG_IOCTL(PR_LOAD, nicogpu_ioc_pr_load)
+NG_IOCTL(RESET, nicogpu_ioc_reset)
 
 /* Render nodes only run ioctls marked DRM_RENDER_ALLOW.  Debug ones add DRM_ROOT_ONLY (CAP_SYS_ADMIN, -EACCES);
  * VM_LOOKUP / PR_LOAD / RESET check CAP_SYS_ADMIN themselves (-EPERM, the ABI v3 behaviour). */
-#define XG_DEF(name, flags) DRM_IOCTL_DEF_DRV(NICOGPU_##name, nicogpu_drm_##name, DRM_RENDER_ALLOW | (flags))
+#define NG_DEF(name, flags) DRM_IOCTL_DEF_DRV(NICOGPU_##name, nicogpu_drm_##name, DRM_RENDER_ALLOW | (flags))
 
 static const struct drm_ioctl_desc nicogpu_ioctls[] = {
-	XG_DEF(PTEATTR, DRM_ROOT_ONLY),
-	XG_DEF(KTEST, DRM_ROOT_ONLY),
-	XG_DEF(DMABUF, DRM_ROOT_ONLY),
-	XG_DEF(DMAFREE, DRM_ROOT_ONLY),
-	XG_DEF(GET_INFO, 0),
-	XG_DEF(GET_GPU_INFO, 0),
-	XG_DEF(GET_TIMESTAMP, 0),
-	XG_DEF(GET_DEV_STATUS, 0),
-	XG_DEF(BO_CREATE, 0),
-	XG_DEF(BO_FREE, 0),
-	XG_DEF(VM_CREATE, 0),
-	XG_DEF(VM_DESTROY, 0),
-	XG_DEF(VM_BIND, 0),
-	XG_DEF(VM_LOOKUP, 0),
-	XG_DEF(QUEUE_CREATE, 0),
-	XG_DEF(QUEUE_DESTROY, 0),
-	XG_DEF(QUEUE_STATUS, 0),
-	XG_DEF(SYNCOBJ_CREATE, 0),
-	XG_DEF(SYNCOBJ_DESTROY, 0),
-	XG_DEF(SYNCOBJ_RESET, 0),
-	XG_DEF(SYNCOBJ_SIGNAL, 0),
-	XG_DEF(SYNCOBJ_WAIT, 0),
-	XG_DEF(SUBMIT, 0),
-	XG_DEF(FENCE_WAIT, 0),
-	XG_DEF(QUEUE_FAULT, 0),
-	XG_DEF(PR_LOAD, 0),
-	XG_DEF(RESET, 0),
+	NG_DEF(PTEATTR, DRM_ROOT_ONLY),
+	NG_DEF(KTEST, DRM_ROOT_ONLY),
+	NG_DEF(DMABUF, DRM_ROOT_ONLY),
+	NG_DEF(DMAFREE, DRM_ROOT_ONLY),
+	NG_DEF(GET_INFO, 0),
+	NG_DEF(GET_GPU_INFO, 0),
+	NG_DEF(GET_TIMESTAMP, 0),
+	NG_DEF(GET_DEV_STATUS, 0),
+	NG_DEF(BO_CREATE, 0),
+	NG_DEF(BO_FREE, 0),
+	NG_DEF(VM_CREATE, 0),
+	NG_DEF(VM_DESTROY, 0),
+	NG_DEF(VM_BIND, 0),
+	NG_DEF(VM_LOOKUP, 0),
+	NG_DEF(QUEUE_CREATE, 0),
+	NG_DEF(QUEUE_DESTROY, 0),
+	NG_DEF(QUEUE_STATUS, 0),
+	NG_DEF(SYNCOBJ_CREATE, 0),
+	NG_DEF(SYNCOBJ_DESTROY, 0),
+	NG_DEF(SYNCOBJ_RESET, 0),
+	NG_DEF(SYNCOBJ_SIGNAL, 0),
+	NG_DEF(SYNCOBJ_WAIT, 0),
+	NG_DEF(SUBMIT, 0),
+	NG_DEF(FENCE_WAIT, 0),
+	NG_DEF(QUEUE_FAULT, 0),
+	NG_DEF(PR_LOAD, 0),
+	NG_DEF(RESET, 0),
 };
 
 static const struct file_operations nicogpu_fops = {

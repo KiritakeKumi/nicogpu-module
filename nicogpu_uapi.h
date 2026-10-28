@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
-/* nicogpu_uapi.h -- PROVISIONAL ioctl/mmap ABI of the nicogpu DRM render node (/dev/dri/renderD*, ABI v5).
+/* nicogpu_uapi.h -- PROVISIONAL ioctl/mmap ABI of the nicogpu DRM render node (/dev/dri/renderD*, ABI v6).
  * Linux ioctl numbering is left to the driver; since ABI v4 the driver is a DRM render node and every ioctl
  * is a DRM driver ioctl: request nr = DRM_COMMAND_BASE (0x40) + the DRM_NICOGPU_* index below, magic 'd' (the
  * DRM_IOCTL_BASE), direction/size encoded by DRM_IO/IOR/IOW/IOWR.  The DRM_NICOGPU_* indices are the old 'X' numbers of
@@ -31,7 +31,7 @@
 #define NICOGPU_MMAP_DMA	0x20000000UL	/* buffer from NICOGPU_IOC_DMABUF (no _WC) */
 #define NICOGPU_MMAP_WC	0x40000000UL
 
-struct nicogpu_pteattr {		/* unchanged layout since ABI v1 */
+struct nicogpu_pteattr {		/* from p0test, unchanged layout */
 	__u64 va;		/* in */
 	__u64 pfn;		/* out */
 	__u64 prot;		/* out */
@@ -39,13 +39,13 @@ struct nicogpu_pteattr {		/* unchanged layout since ABI v1 */
 	__u32 mair;		/* out */
 };
 
-struct nicogpu_ktest {		/* unchanged layout since ABI v1 */
+struct nicogpu_ktest {		/* from p0test, unchanged layout */
 	__u32 bar2_ops, lane_cases, lane_fail;
 	__u32 first_off, first_len, first_got, first_want;
 	__u32 rsvd;
 };
 
-struct nicogpu_dmabuf {		/* unchanged layout since ABI v1 */
+struct nicogpu_dmabuf {		/* from p0test, unchanged layout */
 	__u64 size;		/* in: 1..4 MiB; out: page-rounded */
 	__u64 iova;		/* out: PCIe bus address */
 };
@@ -377,7 +377,7 @@ struct nicogpu_fence_wait {
 
 /* ---- faults, recovery, partial reconfiguration (PROVISIONAL) ----
  * What a GUILTY queue knows about why (VMID, VA, access type and page-table level of
- * the fault), plus the two operator calls: load a partial bitstream (XGPR container) and force a
+ * the fault), plus the two operator calls: load a partial bitstream (NGPR container) and force a
  * reset.  Both operator calls need CAP_SYS_ADMIN. */
 
 #define NICOGPU_FAULT_CAUSE_NONE		0u	/* the queue is not guilty */
@@ -426,7 +426,7 @@ struct nicogpu_queue_fault {
  * Errors: -EINVAL malformed, -ENXIO another shell, -EPROTO interface incompatible, -EBADMSG digest, -E2BIG, -EBUSY,
  * -EPERM (CAP_SYS_ADMIN), -EIO (see result), -ENODEV (wedged), -EFAULT. */
 struct nicogpu_pr_load {
-	__u64 data;		/* in: user pointer to the XGPR container */
+	__u64 data;		/* in: user pointer to the NGPR container */
 	__u64 size;		/* in: bytes: 128-byte header + payload */
 	__u32 flags;		/* in: must be 0 */
 	__u32 result;		/* out: NICOGPU_PR_* (0 when the container was rejected before a load started) */
@@ -598,7 +598,7 @@ struct nicogpu_dev_status {
 #define DRM_IOCTL_NICOGPU_GET_DEV_STATUS	DRM_IOWR(DRM_COMMAND_BASE + DRM_NICOGPU_GET_DEV_STATUS, struct nicogpu_dev_status)
 #define NICOGPU_IOC_GET_DEV_STATUS	DRM_IOCTL_NICOGPU_GET_DEV_STATUS
 
-/* BAR0 scratch byte-lane window used by KTEST */
+/* BAR0 scratch byte-lane window used by KTEST (same as p0test) */
 #define NICOGPU_LANE_LO	0x0C
 #define NICOGPU_LANE_HI	0x18
 #define NICOGPU_SCRATCH_INIT 0x11223344u

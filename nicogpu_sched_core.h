@@ -9,11 +9,11 @@
  * ring-entry encoding (INDIRECT.. + FENCE), 64-bit fence sequence numbers and
  * completion, jobs, queues, binary syncobjs, the in-order scheduler with
  * dependency tracking, the timeout / CP-error handlers (guilty marking, job
-// ABI in nicogpu_uapi.h.
+ * replay after a CP reset) and the CP bring-up handshake.
  * The kernel glue (nicogpu_sched.c) supplies memory, locking, MMIO, time and
  * wake-ups through `struct xsc_ops`, and the ioctl layer.
  *
- * The mapping to drm_sched is
+ * Why this is not drm_sched: its dependency/timeout machinery is what this core re-implements in ~700 testable lines.  The mapping is
  *   drm_sched_job_arm/push      -> xsc_submit()  (arm: seq + syncobj fences)
  *   drm_sched .run_job          -> the ring push in xsc_run()
  *   drm_sched dependencies      -> xsc_job.deps[] (xsc_run only pushes a job
@@ -49,6 +49,7 @@
 #include <stdint.h>
 #include <string.h>
 #endif
+#include "nicogpu_errno.h"
 #include "nicogpu_cmd.h"	/* generated, vendored in gen/ */
 #include "nicogpu_pte.h"	/* generated: MMU_FAULT_* field macros */
 
@@ -56,18 +57,18 @@
 extern "C" {
 #endif
 
-/* Linux errno values, returned negated. */
-#define XSC_ENOENT	2
-#define XSC_EIO		5
-#define XSC_ENOMEM	12
-#define XSC_EBUSY	16
-#define XSC_ENODEV	19
-#define XSC_EINVAL	22
-#define XSC_ENOSPC	28
-#define XSC_ETIME	62
-#define XSC_EPROTO	71
-#define XSC_ETIMEDOUT	110
-#define XSC_ECANCELED	125
+/* Linux errno values, returned negated (aliases of the shared table, nicogpu_errno.h). */
+#define XSC_ENOENT	NGE_NOENT
+#define XSC_EIO		NGE_IO
+#define XSC_ENOMEM	NGE_NOMEM
+#define XSC_EBUSY	NGE_BUSY
+#define XSC_ENODEV	NGE_NODEV
+#define XSC_EINVAL	NGE_INVAL
+#define XSC_ENOSPC	NGE_NOSPC
+#define XSC_ETIME	NGE_TIME
+#define XSC_EPROTO	NGE_PROTO
+#define XSC_ETIMEDOUT	NGE_TIMEDOUT
+#define XSC_ECANCELED	NGE_CANCELED
 
 /* ---- limits (PROVISIONAL) ---------------------------------------------- */
 #define XSC_MAX_IBS		128u	/* cmdbufs per submit */
@@ -77,9 +78,13 @@ extern "C" {
 #define XSC_INDIRECT_DW		5u	/* header + 4 payload */
 #define XSC_FENCE_DW		6u	/* header + 5 payload */
 #define XSC_JOB_MAX_DW		(XSC_MAX_IBS * XSC_INDIRECT_DW + XSC_FENCE_DW)
+/* xsc_run batches: the ready jobs are written to the ring with one ring_write (two at the ring end) and committed
+ * with one doorbell; a batch holds at most this many jobs / ring dwords (a larger run is several batches) */
+#define XSC_BATCH_JOBS		64u
+#define XSC_BATCH_DW		2048u
 #define XSC_RING_LOG2_MIN	10u	/* CP_RING_SIZE_LOG2 range */
 #define XSC_RING_LOG2_MAX	20u
-#define XSC_ERR_HIST		64u	/* remembered failed seqs for xsc_seq_status() */
+#define XSC_ERR_HIST		64u	/* remembered failed seqs for xsc_seq_status */
 #define XSC_NUM_VMIDS		16u
 #define XSC_FAULT_LOG		8u	/* MMU fault records kept */
 #define XSC_FAULT_MATCH_MS	1000u	/* a fault record older than this is not attached to a failing job (PROVISIONAL) */
@@ -99,7 +104,7 @@ extern "C" {
 /* minimum command-stream minor the driver needs: C3 window + FENCE.L2_WB (v0.2) */
 #define XSC_CMD_MAJOR		0u
 #define XSC_CMD_MINOR_MIN	2u
-#define XSC_FW_READY_TIMEOUT_MS	100u
+#define XSC_FW_READY_TIMEOUT_MS	100u	/* CP bring-up step 4 */
 #define XSC_FW_SKIP		1	/* ops->fw_load: nothing to load */
 
 /* syncobj wait flags (== HAL NICOGPU_SYNCOBJ_WAIT_ALL; WAIT_FOR_SUBMIT is an extension) */
@@ -130,7 +135,8 @@ struct xsc_fence {
 				 * was pushed past a blocked older one of another queue */
 	int err;		/* valid once signaled */
 	bool signaled;
-	bool foreign;		/* not produced by this ring: signalled by xsc_fence_signal() */
+	bool foreign;		/* not produced by this ring: signalled by xsc_fence_signal */
+	void *blk;		/* a job's fence: the job allocation it lives in (freed with the last reference) */
 };
 
 /* Binary syncobj: fence == NULL means "no fence yet". */
@@ -247,8 +253,8 @@ enum xsc_cause {
 enum xsc_reset_level {
 	XSC_RST_NONE = 0,
 	XSC_RST_CP = 1,		/* CP_CTRL = ENABLE|RESET, wait CP_STATUS.IDLE */
-	XSC_RST_FW = 2,		/* CORE_RESET + CP bring-up again (firmware dead) */
-	XSC_RST_GPU = 3,	/* GPU zone soft reset (ops->gpu_reset) + restore + CP bring-up */
+	XSC_RST_FW = 2,		/* CORE_RESET + the CP bring-up again (firmware dead) */
+	XSC_RST_GPU = 3,	/* GPU zone soft reset (ops->gpu_reset) + restore + the CP bring-up */
 };
 
 struct xsc_ops {
@@ -268,14 +274,14 @@ struct xsc_ops {
 	int (*read_rptr)(void *ctx, uint32_t *rptr);	/* optional (RPTR write-back page) */
 	/* The level-1 reset (CP_CTRL.RESET).  0 = the CP is reset and idle with
 	 * RPTR == WPTR.  Without XSC_CFG_ESCALATE this is the only recovery hook
-	 * (NULL: no recovery, only the guilty job is failed, the basic contract);
+	 * (NULL: no recovery, only the guilty job is failed, the 09c contract);
 	 * with it the core writes CP_CTRL itself (heartbeat probe, RESET, IDLE
 	 * wait) when this is NULL, and the hook merely replaces that step. */
 	int (*cp_reset)(void *ctx);
 	uint32_t (*reg_rd)(void *ctx, uint32_t off);	/* BAR0 */
 	void (*reg_wr)(void *ctx, uint32_t off, uint32_t val);
 	void (*msleep)(void *ctx, uint32_t ms);
-	/* optional: place the firmware image in C3 during the bring-up.
+	/* optional: place the firmware image in C3 (CP bring-up step 2).
 	 * 0 + its PA/size: written to CP_FW_BASE/SIZE; XSC_FW_SKIP: the image is
 	 * already there (boot ROM / test RM), write nothing; -errno: fail. */
 	int (*fw_load)(void *ctx, uint64_t *base_pa, uint32_t *size);
@@ -306,9 +312,9 @@ struct xsc_cfg {
 	uint64_t ring_pa;	/* CP view (C3 physical), 4 KiB aligned */
 	uint64_t fence_pa;	/* 8-aligned host-memory address of the u64 fence */
 	uint64_t rptr_wb_pa;	/* 4-aligned host address of the RPTR write-back, 0 = off */
-	uint32_t timeout_ms;	/* job timeout (10 s default) */
+	uint32_t timeout_ms;	/* job timeout */
 	uint32_t max_job_ms;	/* 0: timeout_ms is final; else >= timeout_ms, the limit for a job that keeps progressing */
-	uint32_t flags;		/* XSC_CFG_* (0 = the basic behaviour: only ops->cp_reset, no escalation) */
+	uint32_t flags;		/* XSC_CFG_* (0 = the base behaviour: only ops->cp_reset, no escalation) */
 };
 
 struct xsc_stats {
@@ -377,7 +383,9 @@ struct xsc_core {
 	} hist[XSC_ERR_HIST];
 	uint32_t hist_n;
 	struct xsc_stats st;
-	uint32_t pkt[XSC_JOB_MAX_DW];	/* scratch for the (single) pusher */
+	/* scratch of the (single) pusher, xsc_run: the batch being written */
+	uint32_t pkt[XSC_BATCH_DW];
+	struct xsc_job *batch[XSC_BATCH_JOBS];
 };
 
 /* ---- setup ------------------------------------------------------------------ */
@@ -388,7 +396,7 @@ int xsc_init(struct xsc_core *c, const struct xsc_ops *ops, void *ctx, const str
  * jobs still alive (0 = clean). */
 uint32_t xsc_fini(struct xsc_core *c);
 
-/* CP bring-up (worker context).  The ring cursors
+/* CP bring-up, steps 1-6 (worker context).  The ring cursors
  * are set to what CP_RING_RPTR / CP_RING_WPTR show after the boot (0 on a
  * fresh CP; the firmware core keeps WPTR across CORE_RESET); a ring that is not
  * empty is emptied with CP_CTRL.RESET.  In-flight jobs are replayed into the
@@ -432,7 +440,9 @@ int xsc_syncobj_signal(struct xsc_core *c, struct xsc_syncobj *const *so, uint32
  * the first signalled entry (0 when none / WAIT_ALL), may be NULL.  IRQ-safe. */
 int xsc_syncobj_wait_poll(struct xsc_core *c, struct xsc_syncobj *const *so, uint32_t n, uint32_t flags,
 			  uint32_t *first);
+#ifndef __KERNEL__	/* host tests only: not part of the module */
 bool xsc_syncobj_signaled(struct xsc_core *c, struct xsc_syncobj *so);
+#endif
 /* ABI v5 WAIT_AVAILABLE: the same poll, but the condition is "a fence is attached" instead of "the fence has
  * signalled" (submitted / host-signalled, not necessarily complete).  flags: XSC_WAIT_ALL only (XSC_WAIT_FOR_SUBMIT
  * is implied and ignored; anything else -EINVAL).  NULL entry -> -ENOENT, a fence-less entry is never an error.
@@ -479,17 +489,22 @@ int xsc_submit(struct xsc_core *c, struct xsc_queue *q, struct xsc_job *j, const
 
 /* ---- run / complete / recover ------------------------------------------------- */
 
-/* Push pending jobs into the ring while dependencies and space allow, ring
- * the doorbell once per job.  Worker only.  >= 0 jobs pushed; -EBUSY if
- * re-entered; -EIO if a ring/doorbell access failed (that job retires with
- * -EIO, the queue is NOT guilty, c->io_err is set). */
+/* Push pending jobs into the ring while dependencies and space allow: every
+ * ready job that fits is written, then one doorbell commits the batch
+ * (XSC_BATCH_JOBS / XSC_BATCH_DW per batch).  Worker only.  >= 0 jobs pushed;
+ * -EBUSY if re-entered; -EIO if a ring/doorbell access failed: nothing of that
+ * batch reached the CP, its first job retires with -EIO and the others go back
+ * to the pending list (as if that job had been pushed alone and failed), the
+ * queue is NOT guilty, c->io_err is set. */
 int xsc_run(struct xsc_core *c);
 
 /* A fence IRQ (or any poll): read the fence page, retire jobs.  Returns the
  * number of jobs retired.  IRQ-safe. */
 unsigned int xsc_fence_irq(struct xsc_core *c);
+#ifndef __KERNEL__	/* host tests only: not part of the module */
 /* Fresh RPTR value from the write-back page / register.  IRQ-safe. */
 void xsc_rptr_update(struct xsc_core *c, uint32_t rptr);
+#endif
 
 enum xsc_recover {
 	XSC_RECOVER_NONE = 0,		/* nothing wrong */
@@ -500,16 +515,16 @@ enum xsc_recover {
 };
 
 /* Watchdog tick (worker): poll the fence page, then fail the in-flight head
- * job if it has been running longer than cfg.timeout_ms:
- * fence -EIO, queue GUILTY, call ops->cp_reset and replay.  Returns an
+ * job if it has been running longer than cfg.timeout_ms (fence -EIO, queue GUILTY), call
+ * ops->cp_reset and replay.  Returns an
  * enum xsc_recover, or -EIO if cp_reset failed, -EBUSY if re-entered. */
 int xsc_check_timeout(struct xsc_core *c);
 
 /* CP_ERROR interrupt (worker): `error_rptr` = CP_ERROR_RPTR.  Attributes the
  * error to the job whose ring range contains it, same
  * handling as a timeout.  Not attributable (RING_CONFIG / stale): without
- * XSC_CFG_ESCALATE -ENOENT (the basic contract: the caller escalates); with it
- * the core resets the whole device itself (RING_CONFIG: rebuild the ring,
+ * XSC_CFG_ESCALATE -ENOENT (the base contract: the caller escalates); with it
+ * the core resets the whole device itself (RING_CONFIG: rebuild the ring;
  * otherwise CP_CTRL.RESET first), blames no queue and returns
  * XSC_RECOVER_FULL.  `code` is the CP_ERROR value (kept in the queue's fault info). */
 int xsc_cp_error(struct xsc_core *c, uint32_t error_rptr, uint32_t code);
@@ -526,6 +541,8 @@ void xsc_abort_all(struct xsc_core *c, int err);
  * and shows up in that queue's xsc_queue_fault.  Call it BEFORE xsc_cp_error:
  * the fault is latched before the CP halts. */
 void xsc_mmu_fault(struct xsc_core *c, uint32_t status, uint64_t va, uint64_t pte);
+/* The record the last xsc_mmu_fault() decoded (false: none yet). */
+bool xsc_mmu_fault_newest(struct xsc_core *c, struct xsc_mmu_fault *out);
 
 /* CP_FW interrupt (worker): CP_FW_STATUS.PANIC / BOOT_ERR means the firmware is
  * dead: the job at CP_RING_RPTR is blamed, CORE_RESET + the CP bring-up
@@ -549,8 +566,10 @@ int xsc_recover_io(struct xsc_core *c);
  * *out with the reason (may be NULL).  true = guilty. */
 bool xsc_queue_fault_info(struct xsc_core *c, struct xsc_queue *q, struct xsc_queue_fault *out);
 
+#ifndef __KERNEL__	/* host tests only: not part of the module */
 /* Latest incident (devcoredump trigger bookkeeping): serial 0 = none yet. */
 void xsc_last_incident(struct xsc_core *c, struct xsc_incident *out);
+#endif
 bool xsc_is_lost(struct xsc_core *c);
 
 /* Consistent copy of everything a devcoredump needs from the core. */
@@ -594,13 +613,17 @@ void xsc_snapshot(struct xsc_core *c, struct xsc_snap *out);
 
 /* Number of jobs armed and not retired. */
 uint32_t xsc_jobs_alive(struct xsc_core *c);
-/* Jobs currently owned by the CP (for the glue's timer arming). */
+#ifndef __KERNEL__	/* host tests only: not part of the module */
+/* Jobs currently owned by the CP. */
 uint32_t xsc_inflight(struct xsc_core *c);
+#endif
 /* Ring space in dwords as the core currently believes it (tests). */
 uint32_t xsc_ring_free(const struct xsc_core *c);
+#ifndef __KERNEL__	/* host tests only: not part of the module */
 /* Sequence number of the in-flight job whose ring range contains `rptr`:
  * 0, or -ENOENT. */
 int xsc_seq_by_rptr(struct xsc_core *c, uint32_t rptr, uint64_t *seq);
+#endif
 /* No new submits (-ENODEV); pair with xsc_abort_all() + waiting for jobs == 0. */
 void xsc_shutdown(struct xsc_core *c);
 

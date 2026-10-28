@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* Generated file -- do not edit. */
 
 #ifndef NICOGPU_PTE_H

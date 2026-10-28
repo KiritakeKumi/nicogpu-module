@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * nicogpu_dfx.c -- kernel glue of the DFX boundary sequences: GPU-zone soft reset
- * (called by the scheduler core's reset ladder) and partial reconfiguration (NICOGPU_IOC_PR_LOAD / debugfs).
+ * (called by the scheduler core's reset ladder) and partial reconfiguration NICOGPU_IOC_PR_LOAD / debugfs).
  *
  * All sequencing -- register order, timeouts, retry, rollback to the known-good RM -- is in nicogpu_dfx_core.c (pure C,
  * tested on the host against a register-accurate mock shell).  This file supplies the shell/RM register access, the
@@ -26,46 +26,42 @@
 #include "nicogpu_img.h"
 
 #define NICOGPU_PR_DATA		0x1000		/* BAR1: any 32-bit write in this page pushes one word */
-#define NICOGPU_RM_BLANK_FW	"nicogpu/rm_blank.xgpr"
+#define NICOGPU_RM_BLANK_FW	"nicogpu/rm_blank.ngpr"
+#define NICOGPU_RM_BLANK_FW_OLD	"nicogpu/rm_blank.xgpr"	/* name before, tried second */
 
 /* the core carries its own copy of the shell register map: it must be the one of nicogpu_regs.h */
 static_assert(XDF_SH_ID_MAGIC == SH_ID_MAGIC && XDF_SH_VERSION == SH_VERSION && XDF_SH_UID_LO == SH_UID_LO &&
 	      XDF_SH_UID_HI == SH_UID_HI && XDF_SH_IRQ_EOI == SH_IRQ_EOI && XDF_RM_CTRL == RM_CTRL &&
 	      XDF_RM_STATUS == RM_STATUS && XDF_RM_INFO0 == RM_INFO0 && XDF_RM_ERR_COUNT == RM_ERR_COUNT &&
 	      XDF_PR_STATUS == PR_STATUS && XDF_ST_DECOUPLED == RM_ST_DECOUPLED && XDF_ST_RM_READY == RM_ST_READY &&
-	      XDF_RM_ID == RM_ID && XDF_RM_ID_MAGIC == RM_ID_MAGIC, "nicogpu_dfx_core.h register map == nicogpu_regs.h");
-static_assert(NICOGPU_PR_MAX_BYTES < (1ull << 32), "the container length must fit XGPR.payload_bytes");
+	      XDF_RM_ID == RM_ID && XDF_RM_ID_MAGIC == RM_ID_MAGIC && XDF_RM_ID_MAGIC_LEGACY == RM_ID_MAGIC_LEGACY, "nicogpu_dfx_core.h register map == nicogpu_regs.h");
+static_assert(NICOGPU_PR_MAX_BYTES < (1ull << 32), "the container length must fit NGPR.payload_bytes");
 static_assert(XDF_SH_CAPS == SH_CAPS && XDF_CAPS_ICAP_RB == SH_CAPS_ICAP_RB && XDF_PR_OPT == PR_OPT &&
 	      XDF_PR_ICAP_O == PR_ICAP_O && XDF_PR_ICAP_OSTAT == PR_ICAP_OSTAT && XDF_PR_ICAP_WORDS == PR_ICAP_WORDS &&
 	      XDF_PR_RB_CTRL == PR_RB_CTRL && XDF_PR_RB_STATUS == PR_RB_STATUS && XDF_PR_RB_DATA0 == PR_RB_DATA0 &&
 	      XDF_PRS_AVAIL_LOST == PR_ST_AVAIL_LOST && XDF_PRS_EOS == PR_ST_EOS, "register map == nicogpu_regs.h");
+static_assert(XDF_PRS_BUSY == PR_ST_BUSY && XDF_PRS_DONE == PR_ST_DONE && XDF_PRS_ERROR == PR_ST_ERROR &&
+	      XDF_PRS_ECODE_SHIFT == PR_ST_ECODE_SHIFT && XDF_PRS_ICAP_PRERROR == PR_ST_ICAP_PRERR &&
+	      XDF_PRS_ICAP_PRDONE == PR_ST_ICAP_PRDONE && XDF_PRS_PRERROR_RAW == PR_ST_PRERR_RAW &&
+	      XDF_PRS_PRDONE_RAW == PR_ST_PRDONE_RAW && XDF_PRS_ICAP_AVAIL == PR_ST_ICAP_AVAIL &&
+	      XDF_PRS_PRDONE_FELL == PR_ST_PRDONE_FELL && XDF_PRS_EOS_FELL == PR_ST_EOS_FELL, "PR_STATUS bits == nicogpu_regs.h");
 
-/* PR experiments without a new ioctl.  pr_opt is written to PR_OPT before START when non-zero (ORDER[1:0],
- * DONE_SEL[7:6], AVAIL_GATE[8]).  0 keeps the shell default (R1 word order, which the
- * configuration engine ignores); ORDER 1 makes the engine parse the stream and has taken the PCIe
- * link down on the board (2026-10-13/14): only for experiments. */
-static unsigned int pr_opt;
+/* pr_opt is written to PR_OPT before START when non-zero (bit fields of PR_OPT).  Default (all ones) = auto: ORDER 1 on shells with SHELL_CAPS.ICAP_RB (SHELL_REV 3, b18), where it makes the configuration engine parse the stream (verified on the board 2026-10-26); 0 on older shells.
+ * 0 = keep the shell's reset value: ORDER 0 up to SHELL_REV 3 (R1 word order, which the engine ignores, PR is a no-op),
+ * ORDER 1 from SHELL_REV 4 (b19).  Auto writes ORDER 1 explicitly on every ICAP_RB shell, so it behaves
+ * the same on SHELL_REV 3 and 4. */
+static unsigned int pr_opt = ~0u;
 module_param(pr_opt, uint, 0644);
-MODULE_PARM_DESC(pr_opt, "PR_OPT value written before every PR START (0 = shell default; experiments only)");
+MODULE_PARM_DESC(pr_opt, "PR_OPT value written before every PR START (default auto: ORDER 1 on ICAP_RB shells; 0 = shell reset value)");
 static unsigned int icap_rb_skip;
 module_param(icap_rb_skip, uint, 0644);
 MODULE_PARM_DESC(icap_rb_skip, "debugfs icap: read cycles skipped before the 8 captured O words");
 
 /* ---- struct xdf_ops ---------------------------------------------------------------- */
 
-static u32 op_shell_rd(void *ctx, u32 off)
-{
-	return xg_rd(ctx, NICOGPU_BAR_SHELL, off);
-}
-
 static void op_shell_wr(void *ctx, u32 off, u32 val)
 {
-	xg_wr(ctx, NICOGPU_BAR_SHELL, off, val);
-}
-
-static u32 op_rm_rd(void *ctx, u32 off)
-{
-	return xg_rd(ctx, NICOGPU_BAR_CTRL, off);
+	ng_wr(ctx, NICOGPU_BAR_SHELL, off, val);
 }
 
 /* 32-bit posted writes into the PR_DATA page, file byte order (the shell restores the bitstream's big-endian words
@@ -77,11 +73,6 @@ static void op_pr_push(void *ctx, const u8 *data, u32 len)
 
 	iowrite32_rep(x->bar[NICOGPU_BAR_SHELL] + NICOGPU_PR_DATA, data, len / 4);
 	cond_resched();
-}
-
-static void op_msleep(void *ctx, u32 ms)
-{
-	msleep(ms);
 }
 
 static void op_event(void *ctx, enum xdf_event ev, u64 a, u64 b)
@@ -125,8 +116,9 @@ static void op_event(void *ctx, enum xdf_event ev, u64 a, u64 b)
 	case XDF_EV_PR_DIAG: {
 		const struct xdf_pr_diag *g = &x->dfx.core.last_pr;
 
-		dev_info(d, "PR diag: PR_STATUS %08llx (avail %llu avail_lost %llu prdone_fell %llu eos_fell %llu) PR_WORDS %llu "
-			 "ICAP_WORDS %llu O %08x OSTAT %08x PR_OPT %03x\n", a, a >> 13 & 1, a >> 14 & 1, a >> 15 & 1, a >> 16 & 1,
+		dev_info(d, "PR diag: PR_STATUS %08llx (avail %u avail_lost %u prdone_fell %u eos_fell %u) PR_WORDS %llu "
+			 "ICAP_WORDS %llu O %08x OSTAT %08x PR_OPT %03x\n", a, !!(a & PR_ST_ICAP_AVAIL), !!(a & PR_ST_AVAIL_LOST),
+			 !!(a & PR_ST_PRDONE_FELL), !!(a & PR_ST_EOS_FELL),
 			 b & 0xffffffffull, b >> 32, g->icap_o, g->icap_ostat, g->pr_opt);
 		if ((b >> 32) != (b & 0xffffffffull) || (a & XDF_PRS_AVAIL_LOST))
 			dev_warn(d, "PR diag: the ICAP did not take every word cleanly\n");
@@ -140,7 +132,8 @@ static const u8 *op_fallback(void *ctx, size_t *len)
 {
 	struct nicogpu_dev *x = ctx;
 
-	if (!x->dfx.fallback && request_firmware(&x->dfx.fallback, NICOGPU_RM_BLANK_FW, &x->pdev->dev))
+	if (!x->dfx.fallback && request_firmware(&x->dfx.fallback, NICOGPU_RM_BLANK_FW, &x->pdev->dev) &&
+	    request_firmware(&x->dfx.fallback, NICOGPU_RM_BLANK_FW_OLD, &x->pdev->dev))
 		x->dfx.fallback = NULL;
 	if (!x->dfx.fallback)
 		return NULL;
@@ -149,11 +142,11 @@ static const u8 *op_fallback(void *ctx, size_t *len)
 }
 
 static const struct xdf_ops nicogpu_dfx_ops = {
-	.shell_rd = op_shell_rd,
+	.shell_rd = ng_op_shell_rd,
 	.shell_wr = op_shell_wr,
-	.rm_rd = op_rm_rd,
+	.rm_rd = ng_op_rm_rd,
 	.pr_push = op_pr_push,
-	.msleep = op_msleep,
+	.msleep = ng_op_msleep,
 	.event = op_event,
 	.prepare = NULL,		/* the world is stopped by nicogpu_pr_load_buf() before the core runs */
 	.done = NULL,
@@ -192,8 +185,8 @@ static int dfx_ensure(struct nicogpu_dev *x)
 	if (x->dfx.inited)
 		return 0;
 	xdf_cfg_default(&cfg);
-	if (cfg.max_payload > NICOGPU_PR_MAX_BYTES - XIM_XGPR_HDR_SIZE)
-		cfg.max_payload = NICOGPU_PR_MAX_BYTES - XIM_XGPR_HDR_SIZE;
+	if (cfg.max_payload > NICOGPU_PR_MAX_BYTES - XIM_NGPR_HDR_SIZE)
+		cfg.max_payload = NICOGPU_PR_MAX_BYTES - XIM_NGPR_HDR_SIZE;
 	rc = xdf_init(&x->dfx.core, &nicogpu_dfx_ops, x, &cfg);
 	if (!rc)
 		x->dfx.inited = true;
@@ -282,9 +275,13 @@ static int pr_load_buf(struct nicogpu_dev *x, u8 *buf, size_t len, struct nicogp
 	}
 	if (x->mapping)
 		unmap_mapping_range(x->mapping, 0, 0, 1);	/* nobody may read all-ones through a BAR2 mapping */
-	nicogpu_sched_stop(x);					/* CP off, IRQs off, ring and fence page freed */
+	/* the scheduler and the CP stop (CP off, IRQs off, ring and fence page freed); the next queue / syncobj ioctl
+	 * brings them up again */
+	nicogpu_sched_fini(x);
 	mutex_lock(&d->lock);
 	d->core.cfg.pr_opt = READ_ONCE(pr_opt);
+	if (d->core.cfg.pr_opt == ~0u)
+		d->core.cfg.pr_opt = (d->core.shell_caps & XDF_CAPS_ICAP_RB) ? 1 : 0;
 	rc = xdf_pr_load(&d->core, buf, len);
 	out->result = pr_result(&d->core);
 	out->stage = d->core.last_stage;
@@ -307,36 +304,33 @@ out:
 	return rc;
 }
 
-long nicogpu_ioc_pr_load(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_pr_load(struct nicogpu_file *xf, void *data)
 {
 	struct nicogpu_dev *x = xf->x;
-	struct nicogpu_pr_load a;
+	struct nicogpu_pr_load *a = data;
 	u8 *buf;
 	bool kept;
 	long rc;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.flags || a.result || a.stage || a.error || a.rsvd[0] || a.rsvd[1])
+	if (a->flags || a->result || a->stage || a->error || a->rsvd[0] || a->rsvd[1])
 		return -EINVAL;
-	if (a.size < XIM_XGPR_HDR_SIZE)
+	if (a->size < XIM_NGPR_HDR_SIZE)
 		return -EINVAL;
-	if (a.size > NICOGPU_PR_MAX_BYTES)
+	if (a->size > NICOGPU_PR_MAX_BYTES)
 		return -E2BIG;
-	buf = vmalloc(a.size);
+	buf = vmalloc(a->size);
 	if (!buf)
 		return -ENOMEM;
-	if (copy_from_user(buf, u64_to_user_ptr(a.data), a.size)) {
+	if (copy_from_user(buf, u64_to_user_ptr(a->data), a->size)) {
 		vfree(buf);
 		return -EFAULT;
 	}
-	rc = pr_load_buf(x, buf, a.size, &a, &kept);
+	rc = pr_load_buf(x, buf, a->size, a, &kept);
 	if (!kept)
 		vfree(buf);
-	nicogpu_arg_out(up, &a, sizeof(a));	/* result/stage/error are valid with every return code */
-	return rc;
+	return rc;		/* result/stage/error in *a are valid with every return code (DRM copies them out) */
 }
 
 /* debugfs `pr_load`: the container comes from request_firmware(name) */
@@ -353,7 +347,7 @@ int nicogpu_dfx_pr_load_name(struct nicogpu_dev *x, const char *name)
 	if (rc)
 		return rc;
 	len = fw->size;
-	if (len < XIM_XGPR_HDR_SIZE || len > NICOGPU_PR_MAX_BYTES) {
+	if (len < XIM_NGPR_HDR_SIZE || len > NICOGPU_PR_MAX_BYTES) {
 		release_firmware(fw);
 		return -EINVAL;
 	}
@@ -391,17 +385,18 @@ void nicogpu_dfx_icap_show(struct nicogpu_dev *x, struct seq_file *m)
 		seq_printf(m, "no shell (%d)\n", rc);
 		goto out;
 	}
-	st = op_shell_rd(x, XDF_PR_STATUS);
-	opt = op_shell_rd(x, XDF_PR_OPT);
+	st = ng_op_shell_rd(x, XDF_PR_STATUS);
+	opt = ng_op_shell_rd(x, XDF_PR_OPT);
 	seq_printf(m, "SHELL_CAPS     %08x (icap_rb %u)\n", d->core.shell_caps, !!(d->core.shell_caps & XDF_CAPS_ICAP_RB));
 	seq_printf(m, "PR_STATUS      %08x (busy %u done %u err %u ecode %u | latched prerr %u prdone %u | raw prerr %u "
-		   "prdone %u | eos %u avail %u avail_lost %u prdone_fell %u eos_fell %u)\n", st, st & 1, st >> 1 & 1,
-		   st >> 2 & 1, st >> 4 & 0xf, st >> 8 & 1, st >> 9 & 1, st >> 10 & 1, st >> 11 & 1, st >> 12 & 1,
-		   st >> 13 & 1, st >> 14 & 1, st >> 15 & 1, st >> 16 & 1);
-	seq_printf(m, "PR_OPT         %03x (order %u done_sel %u avail_gate %u)  module pr_opt %03x\n", opt, opt & 3,
-		   opt >> 6 & 3, opt >> 8 & 1, READ_ONCE(pr_opt));
-	seq_printf(m, "PR_WORDS       %u  PR_ICAP_WORDS %u\n", op_shell_rd(x, XDF_PR_WORDS), op_shell_rd(x, XDF_PR_ICAP_WORDS));
-	seq_printf(m, "PR_ICAP_O      %08x OSTAT %08x\n", op_shell_rd(x, XDF_PR_ICAP_O), op_shell_rd(x, XDF_PR_ICAP_OSTAT));
+		   "prdone %u | eos %u avail %u avail_lost %u prdone_fell %u eos_fell %u)\n", st, !!(st & PR_ST_BUSY),
+		   !!(st & PR_ST_DONE), !!(st & PR_ST_ERROR), st >> PR_ST_ECODE_SHIFT & 0xf, !!(st & PR_ST_ICAP_PRERR),
+		   !!(st & PR_ST_ICAP_PRDONE), !!(st & PR_ST_PRERR_RAW), !!(st & PR_ST_PRDONE_RAW), !!(st & PR_ST_EOS),
+		   !!(st & PR_ST_ICAP_AVAIL), !!(st & PR_ST_AVAIL_LOST), !!(st & PR_ST_PRDONE_FELL), !!(st & PR_ST_EOS_FELL));
+	seq_printf(m, "PR_OPT         %03x (order %u done_sel %u avail_gate %u)  module pr_opt %03x\n", opt, opt & PR_OPT_ORDER_MASK,
+		   opt >> PR_OPT_DONE_SEL_SHIFT & 3, !!(opt & PR_OPT_AVAIL_GATE), READ_ONCE(pr_opt));
+	seq_printf(m, "PR_WORDS       %u  PR_ICAP_WORDS %u\n", ng_op_shell_rd(x, XDF_PR_WORDS), ng_op_shell_rd(x, XDF_PR_ICAP_WORDS));
+	seq_printf(m, "PR_ICAP_O      %08x OSTAT %08x\n", ng_op_shell_rd(x, XDF_PR_ICAP_O), ng_op_shell_rd(x, XDF_PR_ICAP_OSTAT));
 	if (d->core.last_pr.valid)
 		seq_printf(m, "last PR        PR_STATUS %08x PR_WORDS %u ICAP_WORDS %u O %08x\n", d->core.last_pr.pr_status,
 			   d->core.last_pr.pr_words, d->core.last_pr.icap_words, d->core.last_pr.icap_o);

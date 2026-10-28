@@ -6,8 +6,8 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include <linux/err.h>
-#include <linux/sched.h>
-#include <linux/atomic.h>
+#include <linux/kref.h>
+#include <linux/completion.h>
 #include "nicogpu_fence.h"
 
 /* 64-bit seqnos: dma_fence_ops.use_64bit_seqno up to 6.16; a per-fence flag set by dma_fence_init64() since 6.17
@@ -16,20 +16,16 @@
 #define NICOGPU_FENCE_INIT64 1
 #endif
 
-#define NICOGPU_DEP_MAGIC	0x58444550u	/* "XDEP": a use after free shows up as a bad magic */
-#define NICOGPU_FENCE_MAGIC_FREE 0xdeadf3ceu
-
 /* A foreign fence a job waits for: the dma_fence callback signals the core's external fence.  Two references: one for
  * the armed callback, one for whoever owns the entry (the registering thread, later the teardown). */
 struct nicogpu_dep {
-	u32 magic;
 	struct dma_fence_cb cb;
 	struct list_head node;		/* fs->deps; fs->lock */
 	struct dma_fence *fence;	/* reference, dropped with the last dep reference */
 	struct xsc_fence *ext;		/* the core's external fence; the creation reference lives here until the signal */
 	struct nicogpu_fences *fs;
-	atomic_t refs;
-	bool done;			/* the callback is finished with `fs` for good (teardown waits for it) */
+	struct kref ref;
+	struct completion done;		/* the callback is finished with `fs` for good (teardown waits for it) */
 };
 
 static const struct dma_fence_ops nicogpu_fence_ops;
@@ -251,13 +247,17 @@ void nicogpu_fences_harvest(struct nicogpu_fences *fs, bool gone)
 
 /* ---- waiting for a dma_fence -------------------------------------------------------- */
 
+static void dep_release(struct kref *ref)
+{
+	struct nicogpu_dep *dep = container_of(ref, struct nicogpu_dep, ref);
+
+	dma_fence_put(dep->fence);
+	kfree(dep);
+}
+
 static void dep_put(struct nicogpu_dep *dep)
 {
-	if (atomic_dec_and_test(&dep->refs)) {
-		dma_fence_put(dep->fence);
-		dep->magic = NICOGPU_FENCE_MAGIC_FREE;
-		kfree(dep);
-	}
+	kref_put(&dep->ref, dep_release);
 }
 
 /* may run in IRQ context, under the foreign fence's lock */
@@ -268,7 +268,6 @@ static void nicogpu_dep_cb(struct dma_fence *f, struct dma_fence_cb *cb)
 	struct xsc_core *c = fs->core;
 	unsigned long fl;
 
-	WARN_ON(dep->magic != NICOGPU_DEP_MAGIC);
 	xsc_fence_signal(c, dep->ext, f->error);
 	xsc_fence_put(c, dep->ext);
 	if (fs->kick)
@@ -278,7 +277,7 @@ static void nicogpu_dep_cb(struct dma_fence *f, struct dma_fence_cb *cb)
 	spin_lock_irqsave(&fs->lock, fl);
 	list_del_init(&dep->node);
 	spin_unlock_irqrestore(&fs->lock, fl);
-	WRITE_ONCE(dep->done, true);	/* touches only the dep, which the waiter keeps alive */
+	complete(&dep->done);		/* touches only the dep, which the waiter keeps alive (and so does our reference) */
 	dep_put(dep);			/* the callback's reference */
 }
 
@@ -345,11 +344,12 @@ struct xsc_syncobj *nicogpu_fence_dep(struct nicogpu_fences *fs, struct dma_fenc
 		return ERR_PTR(-ENOMEM);
 	}
 	xsc_syncobj_attach(c, so, ext);		/* the syncobj's own reference; the creation reference stays with dep */
-	dep->magic = NICOGPU_DEP_MAGIC;
 	dep->fs = fs;
 	dep->ext = ext;
 	dep->fence = dma_fence_get(f);
-	atomic_set(&dep->refs, 2);		/* callback + owner */
+	kref_init(&dep->ref);			/* the owner's reference ... */
+	kref_get(&dep->ref);			/* ... and the callback's */
+	init_completion(&dep->done);
 	INIT_LIST_HEAD(&dep->node);
 	spin_lock_irqsave(&fs->lock, fl);
 	if (fs->shut) {
@@ -388,7 +388,7 @@ void nicogpu_fences_stop_deps(struct nicogpu_fences *fs)
 	while (!list_empty(&fs->deps)) {
 		struct nicogpu_dep *dep = list_first_entry(&fs->deps, struct nicogpu_dep, node);
 
-		atomic_inc(&dep->refs);		/* keeps it alive while the lock is dropped */
+		kref_get(&dep->ref);		/* keeps it alive while the lock is dropped */
 		spin_unlock_irqrestore(&fs->lock, fl);
 		if (dma_fence_remove_callback(dep->fence, &dep->cb)) {
 			/* the callback will never run: do what it would have done, minus the signal */
@@ -399,8 +399,7 @@ void nicogpu_fences_stop_deps(struct nicogpu_fences *fs)
 			dep_put(dep);		/* the callback's reference */
 		} else {
 			/* the fence signalled: the callback is running (or finished): it unlinks itself */
-			while (!READ_ONCE(dep->done))
-				cond_resched();
+			wait_for_completion(&dep->done);
 		}
 		dep_put(dep);			/* our temporary reference */
 		spin_lock_irqsave(&fs->lock, fl);

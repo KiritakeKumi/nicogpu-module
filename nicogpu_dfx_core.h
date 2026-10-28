@@ -3,15 +3,14 @@
  * nicogpu_dfx_core.h -- pure-C shell sequences of the DFX boundary:
  *
  *   xdf_gpu_reset()  reset ladder level 2: quiesce -> isolate -> RM_RESET=1 -> 0 -> RM_READY ->
- *                    release -> re-initialise; worst case reload the last good RM
- *   xdf_pr_load()    validate the XGPR container, stop the world, quiesce, isolate +
+ *                    release -> re-initialise; worst case reload the last good RM (3.5 last paragraph)
+ *   xdf_pr_load()    validate the NGPR container, stop the world, quiesce, isolate +
  *                    reset, push the partial bitstream through PR_DATA, wait PR_DONE, identify the RM
- *                    (RM_INFO against the header), release, initialise; retry once on any failure after
+ *                    (RM_INFO against the header), release, initialise; 6.3: retry once on any failure after
  *                    the hardware was touched, then the last known-good RM, then the device is "wedged"
  *
  * The hardware is reached through `struct xdf_ops` (BAR1 shell registers, one BAR0 read, the PR_DATA page,
- * sleeping, time), so the same code runs in the kernel module and against a register-accurate mock shell, which
- * pins every register write of every step.  All the ops are
+ * sleeping, time), so the same code runs in the kernel module and against a register-accurate mock shell, which pins every register write of every step.  All the ops are
  * "sleeping, worker/process context": no lock is held across them and the core has no locks of its own --
  * the caller serialises (the glue holds one mutex for GPU reset and PR).
  *
@@ -20,8 +19,8 @@
  *
  * SHELL_REV 3 (SHELL_CAPS.ICAP_RB): xdf_icap_readback() reads a configuration register of the master SLR
  * through the shell's ICAP readback sequencer (PR_RB_*), xdf_icap_decode() undoes the PR_OPT.ORDER pin transform,
- * cfg.pr_opt is written to PR_OPT before START when non-zero (0 = keep the shell's reset value = the SHELL_REV 2
- * behaviour, so the default register sequence is unchanged), and after every PR attempt on an ICAP_RB shell the
+ * cfg.pr_opt is written to PR_OPT before START when non-zero (0 = keep the shell's reset value: the SHELL_REV 2
+ * behaviour up to SHELL_REV 3, ORDER 1 from SHELL_REV 4; the default register sequence is unchanged), and after every PR attempt on an ICAP_RB shell the
  * core snapshots the PR/ICAP diagnostics into d->last_pr and emits XDF_EV_PR_DIAG.
  */
 #ifndef NICOGPU_DFX_CORE_H
@@ -117,14 +116,26 @@ extern "C" {
 
 /* BAR0 (RM) */
 #define XDF_RM_ID		0x0000u
-#define XDF_RM_ID_MAGIC		0x55504758u	/* "XGPU" */
+#define XDF_RM_ID_MAGIC		0x5550474Eu	/* "NGPU" */
+#define XDF_RM_ID_MAGIC_LEGACY	0x55504758u	/* "XGPU": RMs built before b20, accepted for one version */
 #define XDF_RM_REV		0x0004u		/* [15:0] RM revision */
 
 /* RM_INFO */
-#define XDF_RMINFO_MAGIC	0x4D524758u	/* "XGRM" */
+#define XDF_RMINFO_MAGIC	0x4D52474Eu	/* "NGRM" */
+#define XDF_RMINFO_MAGIC_LEGACY	0x4D524758u	/* "XGRM": RMs built before b20, accepted for one version */
+
+static inline bool xdf_rm_id_ok(uint32_t v)
+{
+	return v == XDF_RM_ID_MAGIC || v == XDF_RM_ID_MAGIC_LEGACY;
+}
+
+static inline bool xdf_rminfo_ok(uint32_t v)
+{
+	return v == XDF_RMINFO_MAGIC || v == XDF_RMINFO_MAGIC_LEGACY;
+}
 
 enum xdf_event {
-	XDF_EV_QUIESCE_FORCED,	/* a = RM_STATUS, b = RM_OUTSTANDING: devcoredump trigger (PR step 3) */
+	XDF_EV_QUIESCE_FORCED,	/* a = RM_STATUS, b = RM_OUTSTANDING: devcoredump trigger (6.2 step 3) */
 	XDF_EV_PR_START,	/* a = payload bytes, b = build_id */
 	XDF_EV_PR_ERROR,	/* a = stage (enum xdf_stage), b = (u32)-errno */
 	XDF_EV_RETRY,		/* the same image is loaded a second time */
@@ -166,19 +177,19 @@ struct xdf_ops {
 	 * xdf_pr_load() returns) to resume.  Both NULL: nothing to stop. */
 	int (*prepare)(void *ctx);
 	void (*done)(void *ctx, int result);
-	/* the blank RM container to fall back to when no known-good image is set; NULL: none */
+	/* 6.3: the blank RM container to fall back to when no known-good image is set; NULL: none */
 	const uint8_t *(*fallback)(void *ctx, size_t *len);
 };
 
-struct xdf_cfg {		/* all in ms; xdf_cfg_default() */
+struct xdf_cfg {		/* all in ms; xdf_cfg_default */
 	uint32_t quiesce_ms;	/* wait QUIESCE_ACK && DRAINED before FORCE (the shell itself times out at 10 ms) */
 	uint32_t decouple_ms;	/* DECOUPLE / RM_RESET to take effect */
 	uint32_t ready_ms;	/* RM_READY after RM_RESET=0 */
 	uint32_t release_ms;	/* !DECOUPLED after DECOUPLE=0 */
 	uint32_t pr_finish_ms;	/* PR_STATUS.DONE|ERROR after FINISH */
 	uint32_t info_ms;	/* RM_STATUS.INFO_VALID after PR */
-	uint32_t max_payload;	/* largest accepted XGPR payload, bytes */
-	uint32_t pr_opt;	/* written to PR_OPT before START when non-zero (0 = shell default, R1 order) */
+	uint32_t max_payload;	/* largest accepted NGPR payload, bytes */
+	uint32_t pr_opt;	/* written to PR_OPT before START when non-zero (0 = shell reset value: ORDER 0 up to SHELL_REV 3, ORDER 1 from 4) */
 };
 void xdf_cfg_default(struct xdf_cfg *cfg);
 
@@ -200,7 +211,7 @@ struct xdf {
 	uint32_t shell_caps;		/* SHELL_CAPS */
 	struct xdf_pr_diag last_pr;
 	uint32_t ctrl;			/* shadow of RM_CTRL */
-	const uint8_t *good;		/* known-good XGPR container (caller owns the memory), NULL */
+	const uint8_t *good;		/* known-good NGPR container (caller owns the memory), NULL */
 	size_t good_len;
 	bool wedged;
 	enum xdf_outcome last;
@@ -216,9 +227,9 @@ int xdf_init(struct xdf *d, const struct xdf_ops *ops, void *ctx, const struct x
 /* The container of the RM that is running and works; the caller keeps the memory alive. */
 void xdf_set_good(struct xdf *d, const uint8_t *img, size_t len);
 
-/* PR step 1 alone (no hardware access): the container checks of xim_xgpr_check() against this
+/* Container check alone (no hardware access): the container checks of xim_ngpr_check() against this
  * shell's UID and interface version.  0 or -XIM_*; the glue calls it before it stops anything. */
-int xdf_check(const struct xdf *d, const uint8_t *img, size_t len, struct xim_xgpr *out);
+int xdf_check(const struct xdf *d, const uint8_t *img, size_t len, struct xim_ngpr *out);
 
 /* Reset ladder level 2.  0 = the RM runs again (it was reset, or reloaded from the good image);
  * -ETIMEDOUT / -EIO / -EPROTO when it did not come back and nothing could be reloaded (wedged); -ENODEV

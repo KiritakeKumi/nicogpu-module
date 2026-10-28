@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// nicogpu_main.c -- Nicogpu PCIe driver (skeleton + memory management + DRM render node): probe, BAR
+// nicogpu_main.c -- Nicogpu PCIe driver: probe, BAR
 // mapping, MSI, drm_device lifetime.
 //
 // Device 10ee:9031 (XDMA AXI-Bridge PF0).  BAR0 1 MiB RM regs, BAR1 64 KiB shell
@@ -22,19 +22,19 @@ module_param(vid, int, 0444);
 MODULE_PARM_DESC(vid, "PCI vendor id to bind (default 0x10ee)");
 static bool bar_lock;
 module_param(bar_lock, bool, 0444);
-MODULE_PARM_DESC(bar_lock, "serialise BAR0/BAR1 register accesses (default off; only needed with a shell built before the xg_bar_router read-order fix)");
+MODULE_PARM_DESC(bar_lock, "serialise BAR0/BAR1 register accesses (default off; only needed with a shell built before the ng_bar_router read-order fix)");
 module_param(did, int, 0444);
 MODULE_PARM_DESC(did, "PCI device id to bind (default 0x9031)");
 
 static irqreturn_t nicogpu_isr(int irq, void *data)
 {
 	struct nicogpu_dev *x = data;
-	u32 sh = xg_rd(x, NICOGPU_BAR_SHELL, SH_IRQ_STATUS);
-	u32 rm = 0;
+	u32 sh = ng_rd(x, NICOGPU_BAR_SHELL, SH_IRQ_STATUS);
+	u32 rm;
 
-	/* RM registers are only reachable (and not all-ones) when not decoupled */
-	if (!(xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS) & RM_ST_DECOUPLED))
-		rm = xg_rd(x, NICOGPU_BAR_CTRL, RM_IRQ_STATUS);
+	/* An isolated / decoupled RM reads all-ones (nicogpu_regs.h, NICOGPU_BAR_CTRL): no RM_STATUS probe first,
+	 * the all-ones check below is the whole test (one non-posted read less per interrupt) */
+	rm = ng_rd(x, NICOGPU_BAR_CTRL, RM_IRQ_STATUS);
 	if (rm == 0xFFFFFFFFu)
 		rm = 0;
 
@@ -46,10 +46,10 @@ static irqreturn_t nicogpu_isr(int irq, void *data)
 	/* W1C the sources first; dropping these while EOIing re-fires forever
 	 * (2026-09-27 board storm, 39356 interrupts). */
 	if (sh)
-		xg_wr(x, NICOGPU_BAR_SHELL, SH_IRQ_STATUS, sh);
+		ng_wr(x, NICOGPU_BAR_SHELL, SH_IRQ_STATUS, sh);
 	if (rm)
-		xg_wr(x, NICOGPU_BAR_CTRL, RM_IRQ_STATUS, rm);
-	xg_wr(x, NICOGPU_BAR_SHELL, SH_IRQ_EOI, 3);	/* re-arm both vectors */
+		ng_wr(x, NICOGPU_BAR_CTRL, RM_IRQ_STATUS, rm);
+	ng_wr(x, NICOGPU_BAR_SHELL, SH_IRQ_EOI, 3);	/* re-arm both vectors */
 	if (rm)
 		nicogpu_sched_irq(x, rm);	/* fence / CP error / MMU fault of the RM */
 	return IRQ_HANDLED;
@@ -61,20 +61,20 @@ void nicogpu_fill_info(struct nicogpu_dev *x, struct nicogpu_info *i)
 
 	i->abi_version = NICOGPU_ABI_VERSION;
 	i->msi_vectors = x->nvec;
-	i->shell_id = xg_rd(x, NICOGPU_BAR_SHELL, SH_ID);
-	i->shell_version = xg_rd(x, NICOGPU_BAR_SHELL, SH_VERSION);
-	i->shell_caps = xg_rd(x, NICOGPU_BAR_SHELL, SH_CAPS);
-	i->shell_status = xg_rd(x, NICOGPU_BAR_SHELL, SH_STATUS);
-	i->shell_uid_lo = xg_rd(x, NICOGPU_BAR_SHELL, SH_UID_LO);
-	i->shell_uid_hi = xg_rd(x, NICOGPU_BAR_SHELL, SH_UID_HI);
-	i->rm_status = xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS);
+	i->shell_id = ng_rd(x, NICOGPU_BAR_SHELL, SH_ID);
+	i->shell_version = ng_rd(x, NICOGPU_BAR_SHELL, SH_VERSION);
+	i->shell_caps = ng_rd(x, NICOGPU_BAR_SHELL, SH_CAPS);
+	i->shell_status = ng_rd(x, NICOGPU_BAR_SHELL, SH_STATUS);
+	i->shell_uid_lo = ng_rd(x, NICOGPU_BAR_SHELL, SH_UID_LO);
+	i->shell_uid_hi = ng_rd(x, NICOGPU_BAR_SHELL, SH_UID_HI);
+	i->rm_status = ng_rd(x, NICOGPU_BAR_SHELL, RM_STATUS);
 	for (b = 0; b < 4; b++)
-		i->rm_info[b] = xg_rd(x, NICOGPU_BAR_SHELL, RM_INFO0 + 4 * b);
-	i->clk_freq_khz[0] = xg_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_CORE);
-	i->clk_freq_khz[1] = xg_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_L2);
-	i->clk_freq_khz[2] = xg_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_TS);
-	i->clk_freq_khz[3] = xg_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_CORE2X);
-	i->clk_status = xg_rd(x, NICOGPU_BAR_SHELL, CLK_STATUS);
+		i->rm_info[b] = ng_rd(x, NICOGPU_BAR_SHELL, RM_INFO0 + 4 * b);
+	i->clk_freq_khz[0] = ng_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_CORE);
+	i->clk_freq_khz[1] = ng_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_L2);
+	i->clk_freq_khz[2] = ng_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_TS);
+	i->clk_freq_khz[3] = ng_rd(x, NICOGPU_BAR_SHELL, CLK_FREQ_CORE2X);
+	i->clk_status = ng_rd(x, NICOGPU_BAR_SHELL, CLK_STATUS);
 	for (b = 0; b < NICOGPU_NUM_BARS; b++)
 		i->bar_len[b] = pci_resource_len(x->pdev, b);
 	i->irq_count = atomic64_read(&x->irq_count);
@@ -122,8 +122,8 @@ static int nicogpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	for (i = 0; i < NICOGPU_NUM_BARS; i++)
 		x->bar[i] = pcim_iomap_table(pdev)[i];
 
-	shid = xg_rd(x, NICOGPU_BAR_SHELL, SH_ID);
-	ver = xg_rd(x, NICOGPU_BAR_SHELL, SH_VERSION);
+	shid = ng_rd(x, NICOGPU_BAR_SHELL, SH_ID);
+	ver = ng_rd(x, NICOGPU_BAR_SHELL, SH_VERSION);
 	if (shid != SH_ID_MAGIC) {
 		dev_err(&pdev->dev, "SHELL_ID %08x != XSHL (link down or wrong build)\n", shid);
 		return -ENODEV;
@@ -153,8 +153,7 @@ static int nicogpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			return rc;
 		}
 	}
-	x->irq_on = true;
-	xg_wr(x, NICOGPU_BAR_SHELL, SH_IRQ_ENABLE, SH_IRQ_ALL);
+	ng_wr(x, NICOGPU_BAR_SHELL, SH_IRQ_ENABLE, SH_IRQ_ALL);
 
 	rc = nicogpu_mm_init(x);
 	if (rc) {
@@ -173,11 +172,11 @@ static int nicogpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 	nicogpu_debugfs_init(x);
 	dev_info(&pdev->dev, "nicogpu ready: shell rev %u iface %04x status %08x, render node renderD%d\n",
-		 ver & 0xFFFF, ver >> 16, xg_rd(x, NICOGPU_BAR_SHELL, SH_STATUS), x->drm.render->index);
+		 ver & 0xFFFF, ver >> 16, ng_rd(x, NICOGPU_BAR_SHELL, SH_STATUS), x->drm.render->index);
 	return 0;
 
 err_irq:
-	xg_wr(x, NICOGPU_BAR_SHELL, SH_IRQ_ENABLE, 0);
+	ng_wr(x, NICOGPU_BAR_SHELL, SH_IRQ_ENABLE, 0);
 	for (i = 0; i < x->nvec; i++)
 		free_irq(pci_irq_vector(pdev, i), x);
 	pci_free_irq_vectors(pdev);
@@ -194,14 +193,13 @@ static void nicogpu_remove(struct pci_dev *pdev)
 	 * all-ones, GTT / DMA buffers are freed below) and tear down what the files still own while the device is alive */
 	nicogpu_debugfs_fini(x);
 	drm_dev_unplug(&x->drm);
-	x->dead = true;
 	unmap_mapping_range(x->mapping, 0, 0, 1);
 	nicogpu_mm_remove_files(x);	/* queues / VMs still owned by open files (their BOs are dropped at close) */
 	nicogpu_dma_free(x);
 	nicogpu_sched_fini(x);		/* CP off, work items stopped, ring/fence page freed */
 	nicogpu_dfx_fini(x);
 	nicogpu_mm_fini(x);
-	xg_wr(x, NICOGPU_BAR_SHELL, SH_IRQ_ENABLE, 0);
+	ng_wr(x, NICOGPU_BAR_SHELL, SH_IRQ_ENABLE, 0);
 	for (i = 0; i < x->nvec; i++)
 		free_irq(pci_irq_vector(pdev, i), x);
 	pci_free_irq_vectors(pdev);

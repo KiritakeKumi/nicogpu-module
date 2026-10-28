@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
 /*
  * nicogpu_dfx_core.c -- shell sequences of the DFX boundary: GPU-zone soft reset
- * and partial reconfiguration.  See nicogpu_dfx_core.h.
+ *  and partial reconfiguration (6.2/6.3).  See nicogpu_dfx_core.h.
  */
 #include "nicogpu_dfx_core.h"
 
-#define E_NODEV		19
-#define E_BUSY		16
-#define E_IO		5
-#define E_TIMEDOUT	110
-#define E_PROTO		71
+/* the shared errno table (nicogpu_errno.h, via nicogpu_img.h) */
+#define E_NODEV		NGE_NODEV
+#define E_BUSY		NGE_BUSY
+#define E_IO		NGE_IO
+#define E_TIMEDOUT	NGE_TIMEDOUT
+#define E_PROTO		NGE_PROTO
 
 static void emit(const struct xdf *d, enum xdf_event ev, uint64_t a, uint64_t b)
 {
@@ -25,7 +26,7 @@ void xdf_cfg_default(struct xdf_cfg *cfg)
 	cfg->release_ms = 100;
 	cfg->pr_finish_ms = 2000;		/* FIFO drain + ICAP at 400 MB/s after the last word */
 	cfg->info_ms = 10;
-	cfg->max_payload = 256u << 20;		/* a full-RP partial bitstream is ~70 MB */
+	cfg->max_payload = 256u << 20;		/* a full-RP partial bitstream is ~70 MB (build25) */
 	cfg->pr_opt = 0;			/* keep the shell's PR_OPT reset value */
 }
 
@@ -76,7 +77,7 @@ static int wait_status(struct xdf *d, uint32_t mask, uint32_t want, uint32_t ms,
 	}
 }
 
-/* PR steps 2-4: IRQ forwarding off, quiesce (FORCE on timeout), DECOUPLE, RM_RESET.  Idempotent: an RM
+/* 6.2 steps 2-4: IRQ forwarding off, quiesce (FORCE on timeout), DECOUPLE, RM_RESET.  Idempotent: an RM
  * that is already isolated (power-up, a failed attempt) only gets the reset. */
 static int seq_isolate(struct xdf *d)
 {
@@ -110,7 +111,7 @@ static int seq_isolate(struct xdf *d)
 	return wait_status(d, XDF_ST_IN_RESET, XDF_ST_IN_RESET, d->cfg.decouple_ms, NULL);
 }
 
-/* PR step 8: RM_RESET = 0, RM_READY, DECOUPLE = 0, wait !DECOUPLED.  If the shell keeps the isolation
+/* 6.2 step 8 / 3.6: RM_RESET = 0, RM_READY, DECOUPLE = 0, wait !DECOUPLED.  If the shell keeps the isolation
  * because the RM is not acceptable, say why (-EPROTO) instead of a plain timeout. */
 static int seq_release(struct xdf *d)
 {
@@ -139,12 +140,12 @@ static void quarantine(struct xdf *d)
 	(void)seq_isolate(d);
 }
 
-/* PR step 9: BAR0 ID (and REV when known), IRQ_FWD_EN = 1, EOI. */
+/* 6.2 step 9: BAR0 ID (and REV when known), IRQ_FWD_EN = 1, EOI. */
 static int seq_init(struct xdf *d)
 {
 	uint32_t id = d->ops->rm_rd(d->ctx, XDF_RM_ID);
 
-	if (id != XDF_RM_ID_MAGIC) {
+	if (!xdf_rm_id_ok(id)) {
 		quarantine(d);
 		return -E_NODEV;
 	}
@@ -175,8 +176,8 @@ static void pr_diag(struct xdf *d)
 	emit(d, XDF_EV_PR_DIAG, g->pr_status, ((uint64_t)g->icap_words << 32) | g->pr_words);
 }
 
-/* PR step 6: PR_EXPECT_WORDS, START, 4 KiB blocks into PR_DATA, FINISH, wait DONE|ERROR. */
-static int seq_pr(struct xdf *d, const struct xim_xgpr *x)
+/* 6.2 step 6: PR_EXPECT_WORDS, START, 4 KiB blocks into PR_DATA, FINISH, wait DONE|ERROR. */
+static int seq_pr(struct xdf *d, const struct xim_ngpr *x)
 {
 	const struct xdf_ops *o = d->ops;
 	uint32_t off, st = 0, t, nblk = 0;
@@ -225,8 +226,8 @@ abort:
 	return rc;
 }
 
-/* PR step 7: RM_INFO0..3 against the container header. */
-static int seq_identify(struct xdf *d, const struct xim_xgpr *x)
+/* 6.2 step 7: RM_INFO0..3 against the container header. */
+static int seq_identify(struct xdf *d, const struct xim_ngpr *x)
 {
 	const struct xdf_ops *o = d->ops;
 	uint32_t i0, i1, i2, i3;
@@ -239,14 +240,14 @@ static int seq_identify(struct xdf *d, const struct xim_xgpr *x)
 	i1 = o->shell_rd(d->ctx, XDF_RM_INFO0 + 4);
 	i2 = o->shell_rd(d->ctx, XDF_RM_INFO0 + 8);
 	i3 = o->shell_rd(d->ctx, XDF_RM_INFO0 + 12);
-	if (i0 != XDF_RMINFO_MAGIC || i1 != (((uint32_t)x->rm_kind << 16) | x->iface_version) || i2 != x->build_id ||
+	if (!xdf_rminfo_ok(i0) || i1 != (((uint32_t)x->rm_kind << 16) | x->iface_version) || i2 != x->build_id ||
 	    i3 != (((uint32_t)x->mem_mask << 16) | x->rm_rev))
 		return -E_PROTO;
 	return 0;
 }
 
 /* one complete load attempt, steps 3-9; the RM is isolated + in reset again on failure */
-static int load_once(struct xdf *d, const struct xim_xgpr *x)
+static int load_once(struct xdf *d, const struct xim_ngpr *x)
 {
 	enum xdf_stage stage = XDF_STAGE_ISOLATE;
 	int rc;
@@ -280,11 +281,11 @@ static int load_once(struct xdf *d, const struct xim_xgpr *x)
 	return rc;
 }
 
-/* The last known-good container, then the blank fallback.  `bad` is the container that just failed
+/* 6.3: the last known-good container, then the blank fallback.  `bad` is the container that just failed
  * (its twin in `good` would fail again): skipped. */
-static int restore(struct xdf *d, const struct xim_xgpr *bad)
+static int restore(struct xdf *d, const struct xim_ngpr *bad)
 {
-	const struct xim_xgpr_policy pol = { d->shell_uid, d->shell_iface, d->cfg.max_payload };
+	const struct xim_ngpr_policy pol = { d->shell_uid, d->shell_iface, d->cfg.max_payload };
 	const uint8_t *img[2];
 	size_t len[2];
 	int i, rc = -E_IO;
@@ -296,11 +297,11 @@ static int restore(struct xdf *d, const struct xim_xgpr *bad)
 	if (d->ops->fallback)
 		img[1] = d->ops->fallback(d->ctx, &len[1]);
 	for (i = 0; i < 2; i++) {
-		struct xim_xgpr x;
+		struct xim_ngpr x;
 
 		if (!img[i])
 			continue;
-		rc = xim_xgpr_check(img[i], len[i], &pol, &x);
+		rc = xim_ngpr_check(img[i], len[i], &pol, &x);
 		if (!rc && bad && !memcmp(x.sha256, bad->sha256, 32) && x.build_id == bad->build_id)
 			continue;	/* the same bits again */
 		if (!rc)
@@ -349,16 +350,16 @@ int xdf_gpu_reset(struct xdf *d)
 	return rc;
 }
 
-int xdf_check(const struct xdf *d, const uint8_t *img, size_t len, struct xim_xgpr *out)
+int xdf_check(const struct xdf *d, const uint8_t *img, size_t len, struct xim_ngpr *out)
 {
-	const struct xim_xgpr_policy pol = { d->shell_uid, d->shell_iface, d->cfg.max_payload };
+	const struct xim_ngpr_policy pol = { d->shell_uid, d->shell_iface, d->cfg.max_payload };
 
-	return xim_xgpr_check(img, len, &pol, out);
+	return xim_ngpr_check(img, len, &pol, out);
 }
 
 int xdf_pr_load(struct xdf *d, const uint8_t *img, size_t len)
 {
-	struct xim_xgpr x;
+	struct xim_ngpr x;
 	int rc;
 
 	if (d->wedged)
@@ -386,7 +387,7 @@ int xdf_pr_load(struct xdf *d, const uint8_t *img, size_t len)
 	emit(d, XDF_EV_PR_START, x.payload_bytes, x.build_id);
 	d->st.loads++;
 	rc = load_once(d, &x);
-	if (rc) {			/* retry once */
+	if (rc) {			/* 6.3: retry once */
 		d->st.retries++;
 		emit(d, XDF_EV_RETRY, 0, 0);
 		rc = load_once(d, &x);
@@ -398,7 +399,7 @@ int xdf_pr_load(struct xdf *d, const uint8_t *img, size_t len)
 			d->ops->done(d->ctx, 0);
 		return 0;
 	}
-	/* back to the last good RM, then the blank one, then wedged */
+	/* 6.3: back to the last good RM, then the blank one, then wedged */
 	if (!restore(d, &x)) {
 		d->st.restored++;
 		d->last = XDF_OUT_RESTORED;

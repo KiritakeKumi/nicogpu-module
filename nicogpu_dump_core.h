@@ -2,7 +2,7 @@
 /*
  * nicogpu_dump_core.h -- devcoredump content builder, pure C.
  *
- * Collects what a devcoredump is asked to contain --
+ * Collects what the UAPI asks a devcoredump to contain --
  * CP_ERROR*, MMU_FAULT_* (VMID, VA, access, level, PTE), RM_STATUS / RM_OUTSTANDING / RM_ERR_COUNT /
  * RM_INFO* / PR_STATUS / SHELL_STATUS, the ring / fence / job state of the scheduler core (a consistent
  * struct xsc_snap), the failing jobs' command buffers (VA, size: the contents are NOT copied -- the CPU never
@@ -24,10 +24,16 @@ extern "C" {
 
 #define XDD_MAX_REGS	64u
 
+/* the shell registers the dump reads (BAR1); the core carries its own copy, pinned to nicogpu_regs.h by a static_assert in
+ * nicogpu_sched.c */
+#define XDD_SH_STATUS		0x0020u
+#define XDD_SH_IRQ_STATUS	0x0040u
+#define XDD_SH_IRQ_ENABLE	0x0044u
+
 enum xdd_reason {
 	XDD_R_MANUAL = 0,	/* debugfs / test */
 	XDD_R_INCIDENT,		/* a job failed: cause in the snapshot's incident */
-	XDD_R_QUIESCE_FORCED,	/* PR step 3 had to FORCE */
+	XDD_R_QUIESCE_FORCED,	/* had to FORCE */
 	XDD_R_PR_FAILED,	/* a PR attempt failed (xdd_dfx.stage / err) */
 	XDD_R_DEVICE_LOST,	/* every reset level failed */
 };
@@ -42,7 +48,7 @@ struct xdd_reg {
 
 struct xdd_regs {
 	uint32_t n;
-	bool rm_visible;	/* BAR0 was reachable and answered "XGPU" */
+	bool rm_visible;	/* BAR0 was reachable and answered "NGPU" */
 	struct xdd_reg r[XDD_MAX_REGS];
 };
 
@@ -53,7 +59,7 @@ struct xdd_io {
 };
 
 /* Read the register set (the shell's always; the RM's only if RM_STATUS says it is not decoupled and BAR0 ID
- * reads "XGPU").  Worker context. */
+ * reads "NGPU").  Worker context. */
 void xdd_collect_regs(const struct xdd_io *io, struct xdd_regs *out);
 
 struct xdd_dfx {		/* shell-level state of the DFX core, optional */

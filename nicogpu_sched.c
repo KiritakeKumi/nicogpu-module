@@ -21,7 +21,7 @@
  *
  * It also adds, on the same worker: the MMU fault latch hand-over (before the CP error is attributed), the
  * firmware-event / I/O recovery entry points and manual reset requests, the real CP firmware loader
- * (request_firmware + xim_xgcf_check + the C3 window), the structured queue fault ioctl and the devcoredump trigger.
+ * (request_firmware + xim_ngcf_check + the C3 window), the structured queue fault ioctl and the devcoredump trigger.
  * The reset ladder itself (CP_CTRL.RESET -> firmware reload -> GPU-zone reset -> device lost) is in the core.
  *
  * Not compiled on the host: checked only against stub headers.
@@ -62,7 +62,7 @@ module_param(sched_fw_preloaded, bool, 0444);
 MODULE_PARM_DESC(sched_fw_preloaded, "skip the CP firmware load (the RM carries its own image)");
 static char sched_fw_name[64] = "nicogpu/cp_fw.bin";
 module_param_string(sched_fw_name, sched_fw_name, sizeof(sched_fw_name), 0444);
-MODULE_PARM_DESC(sched_fw_name, "request_firmware() name of the CP firmware image (XGCF)");
+MODULE_PARM_DESC(sched_fw_name, "request_firmware() name of the CP firmware image (NGCF)");
 static bool sched_l2_keep_ctx;
 module_param(sched_l2_keep_ctx, bool, 0444);
 MODULE_PARM_DESC(sched_l2_keep_ctx, "after a GPU-zone reset keep the other queues alive and replay their jobs (default: they are lost)");
@@ -85,6 +85,8 @@ static_assert(sizeof(struct nicogpu_cmdbuf) == sizeof(struct xsc_ib) &&
 	      offsetof(struct nicogpu_cmdbuf, size_dw) == offsetof(struct xsc_ib, size_dw) &&
 	      offsetof(struct nicogpu_cmdbuf, flags) == offsetof(struct xsc_ib, flags), "cmdbuf == xsc_ib");
 static_assert(NICOGPU_SUBMIT_MAX_CMDBUFS == XSC_MAX_IBS && NICOGPU_SUBMIT_MAX_SYNCS == XSC_MAX_SYNCS, "limits");
+static_assert(XDD_SH_STATUS == SH_STATUS && XDD_SH_IRQ_STATUS == SH_IRQ_STATUS && XDD_SH_IRQ_ENABLE == SH_IRQ_ENABLE,
+	      "nicogpu_dump_core.h shell register offsets == nicogpu_regs.h");
 static_assert(NICOGPU_SYNCOBJ_WAIT_ALL == XSC_WAIT_ALL && NICOGPU_SYNCOBJ_WAIT_FOR_SUBMIT == XSC_WAIT_FOR_SUBMIT, "wait flags");
 
 /* ---- struct xsc_ops ------------------------------------------------------- */
@@ -131,7 +133,7 @@ static u64 op_now_ms(void *ctx)
 	return div_u64(ktime_get_ns(), NSEC_PER_MSEC);
 }
 
-/* the CP writes the 64-bit seqno with one posted PCIe write;
+/* the CP writes the 64-bit seqno with one posted PCIe write ;
  * little-endian host only, like the rest of the driver */
 static u64 op_read_fence(void *ctx)
 {
@@ -169,8 +171,7 @@ static void op_event(void *ctx, enum xsc_event ev, u64 a, u64 b)
 	case XSC_EV_CP_ERROR:
 		dev_err(d, "CP error %llu attributed to job %llu\n", b, a);
 		break;
-	case XSC_EV_MMU_FAULT:
-		dev_err(d, "MMU fault recorded: va %llx status %08llx\n", a, b);
+	case XSC_EV_MMU_FAULT:		/* decoded and logged once by sched_read_mmu_fault */
 		break;
 	case XSC_EV_INCIDENT:
 		/* under the core lock: only note it, the worker takes the dump (sleeping) */
@@ -203,15 +204,17 @@ static int op_ring_write(void *ctx, u32 dw_idx, const u32 *dw, u32 n)
 }
 
 /* ring contents are posted BAR2 writes; the doorbell must not pass them
- * (the shell holds it back; wmb() is the CPU side) */
+ * (the shell holds it back until the BAR2 writes have landed; wmb() is the CPU side).
+ * The core rings the doorbell only right after the ring write of the same batch succeeded, and that write
+ * (nicogpu_mm_c3_write -> win_alive) has just read RM_STATUS (not decoupled) and C3_WIN_CTRL: no second RM_STATUS
+ * read here.  An RM decoupled in between drops the posted write (an isolated RM ignores writes); the job then times
+ * out and the reset ladder / I/O recovery takes over, as for any doorbell lost on the way. */
 static int op_doorbell(void *ctx, u32 wptr)
 {
 	struct nicogpu_dev *x = ctx_x(ctx);
 
-	if (xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS) & RM_ST_DECOUPLED)
-		return -EIO;
 	wmb();
-	xg_wr(x, NICOGPU_BAR_CTRL, NICOGPU_REG_DOORBELL0, wptr);
+	ng_wr(x, NICOGPU_BAR_CTRL, NICOGPU_REG_DOORBELL0, wptr);
 	return 0;
 }
 
@@ -223,46 +226,36 @@ static int op_read_rptr(void *ctx, u32 *rptr)
 
 static u32 op_reg_rd(void *ctx, u32 off)
 {
-	return xg_rd(ctx_x(ctx), NICOGPU_BAR_CTRL, off);
+	return ng_rd(ctx_x(ctx), NICOGPU_BAR_CTRL, off);
 }
 
 /* Progress of the head job for the timeout: the CP's RPTR, and on rm_sp the debug page's retired-instruction
  * count (COMMIT_TOTAL; it moves while a long dispatch runs, RPTR does not). */
-#define NICOGPU_RSP_DBG_COMMIT_TOTAL	0x0824u
 static u64 op_progress(void *ctx)
 {
 	struct nicogpu_dev *x = ctx_x(ctx);
-	u64 p = xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_RING_RPTR);
+	u64 p = ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_RING_RPTR);
 
-	if (nicogpu_rm_kind(x) == XGI_RM_KIND_SP)
-		p |= (u64)xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_RSP_DBG_COMMIT_TOTAL) << 32;
+	if (nicogpu_rm_kind(x) == NGI_RM_KIND_SP)
+		p |= (u64)ng_rd(x, NICOGPU_BAR_CTRL, RSP_DBG_COMMIT_TOTAL) << 32;
 	return p;
 }
-
-/* rm_sp debug page SP_STATUS bit 30 = SP idle (no dispatch in the work distributor / warps) */
-#define NICOGPU_RSP_DBG_SP_STATUS		0x0804u
-#define NICOGPU_RSP_DBG_SP_IDLE		BIT(30)
 
 static int op_engine_busy(void *ctx)
 {
 	struct nicogpu_dev *x = ctx_x(ctx);
 
-	if (nicogpu_rm_kind(x) != XGI_RM_KIND_SP)
+	if (nicogpu_rm_kind(x) != NGI_RM_KIND_SP)
 		return 0;
-	return !(xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_RSP_DBG_SP_STATUS) & NICOGPU_RSP_DBG_SP_IDLE);
+	return !(ng_rd(x, NICOGPU_BAR_CTRL, RSP_DBG_SP_STATUS) & RSP_DBG_SP_IDLE);
 }
 
 static void op_reg_wr(void *ctx, u32 off, u32 val)
 {
-	xg_wr(ctx_x(ctx), NICOGPU_BAR_CTRL, off, val);
+	ng_wr(ctx_x(ctx), NICOGPU_BAR_CTRL, off, val);
 }
 
-static void op_msleep(void *ctx, u32 ms)
-{
-	msleep(ms);
-}
-
-/* The firmware image is validated (xim_xgcf_check: header, CRC-32, command-stream
+/* The CP firmware image is validated (xim_ngcf_check: header, CRC-32, command-stream
  * version) and written to the C3 front region at fw_off through the window.  C3 is static DDR: a later
  * handshake (firmware reload, GPU-zone reset) finds it still there and does not write it again. */
 static int op_fw_load(void *ctx, u64 *base_pa, u32 *size)
@@ -270,7 +263,7 @@ static int op_fw_load(void *ctx, u64 *base_pa, u32 *size)
 	struct nicogpu_sched *s = ctx_s(ctx);
 	struct nicogpu_dev *x = ctx_x(ctx);
 	const struct firmware *fw;
-	struct xim_xgcf info;
+	struct xim_ngcf info;
 	int rc;
 
 	if (sched_fw_preloaded)
@@ -286,9 +279,9 @@ static int op_fw_load(void *ctx, u64 *base_pa, u32 *size)
 			sched_fw_name, rc);
 		return rc;
 	}
-	rc = xim_xgcf_check(fw->data, fw->size, NICOGPU_C3_FW_RESERVE, XSC_CMD_MAJOR, XSC_CMD_MINOR_MIN, &info);
+	rc = xim_ngcf_check(fw->data, fw->size, NICOGPU_C3_FW_RESERVE, XSC_CMD_MAJOR, XSC_CMD_MINOR_MIN, &info);
 	if (rc) {
-		dev_err(&x->pdev->dev, "CP firmware \"%s\" rejected (%d): not an XGCF image / CRC / command-stream version\n",
+		dev_err(&x->pdev->dev, "CP firmware \"%s\" rejected (%d): not an NGCF image / CRC / command-stream version\n",
 			sched_fw_name, rc);
 		release_firmware(fw);
 		return rc;
@@ -332,7 +325,7 @@ static const struct xsc_ops nicogpu_sched_ops = {
 	.cp_reset = NULL,
 	.reg_rd = op_reg_rd,
 	.reg_wr = op_reg_wr,
-	.msleep = op_msleep,
+	.msleep = ng_op_msleep,
 	.fw_load = op_fw_load,
 	.gpu_reset = op_gpu_reset,
 	.rm_restore = op_rm_restore,
@@ -370,36 +363,29 @@ static void sched_kick(struct nicogpu_sched *s)
 	sched_arm_watchdog(s);
 }
 
-static bool rm_up(struct nicogpu_dev *x)
-{
-	return !(xg_rd(x, NICOGPU_BAR_SHELL, RM_STATUS) & RM_ST_DECOUPLED);
-}
-
-/* The fault is latched before the CP halts.  Read the latch, give it to the core (it is
+/* / The fault is latched before the CP halts.  Read the latch, give it to the core (it is
  * attached to the job the CP error / timeout blames), clear it (W1C VALID also clears MULTI). */
 static void sched_read_mmu_fault(struct nicogpu_sched *s)
 {
 	struct nicogpu_dev *x = s->x;
+	struct xsc_mmu_fault f;
 	u32 st;
 	u64 va, pte;
 
-	if (!rm_up(x))
+	if (!ng_rm_present(x))
 		return;
-	st = xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_STATUS);
+	st = ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_STATUS);
 	if (st == 0xffffffffu || !(st & NICOGPU_REG_MMU_FAULT_STATUS_VALID_MASK))
 		return;
-	va = ((u64)xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_VA_HI) << 32) | xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_VA_LO);
-	pte = ((u64)xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_PTE_HI) << 32) |
-	      xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_PTE_LO);
-	dev_err(&x->pdev->dev, "MMU fault: vmid %u va %llx %s level %u code %u pte %llx%s\n",
-		(st & NICOGPU_REG_MMU_FAULT_STATUS_VMID_MASK) >> NICOGPU_REG_MMU_FAULT_STATUS_VMID_SHIFT, va,
-		((st & NICOGPU_REG_MMU_FAULT_STATUS_ACCESS_MASK) >> NICOGPU_REG_MMU_FAULT_STATUS_ACCESS_SHIFT) == 0 ? "read" :
-		((st & NICOGPU_REG_MMU_FAULT_STATUS_ACCESS_MASK) >> NICOGPU_REG_MMU_FAULT_STATUS_ACCESS_SHIFT) == 1 ? "write" : "exec",
-		(st & NICOGPU_REG_MMU_FAULT_STATUS_LEVEL_MASK) >> NICOGPU_REG_MMU_FAULT_STATUS_LEVEL_SHIFT,
-		(st & NICOGPU_REG_MMU_FAULT_STATUS_CODE_MASK) >> NICOGPU_REG_MMU_FAULT_STATUS_CODE_SHIFT, pte,
-		(st & NICOGPU_REG_MMU_FAULT_STATUS_MULTI_MASK) ? " (more faults dropped)" : "");
+	va = ((u64)ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_VA_HI) << 32) | ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_VA_LO);
+	pte = ((u64)ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_PTE_HI) << 32) |
+	      ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_PTE_LO);
 	xsc_mmu_fault(&s->core, st, va, pte);
-	xg_wr(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_STATUS, NICOGPU_REG_MMU_FAULT_STATUS_VALID_MASK);
+	if (xsc_mmu_fault_newest(&s->core, &f))		/* the core's decode: logged once, here */
+		dev_err(&x->pdev->dev, "MMU fault: vmid %u va %llx %s level %u code %u pte %llx%s\n", f.vmid, f.va,
+			f.access == 0 ? "read" : f.access == 1 ? "write" : "exec", f.level, f.code, f.pte,
+			f.multi ? " (more faults dropped)" : "");
+	ng_wr(x, NICOGPU_BAR_CTRL, NICOGPU_REG_MMU_FAULT_STATUS, NICOGPU_REG_MMU_FAULT_STATUS_VALID_MASK);
 }
 
 static void sched_log_recover(struct nicogpu_sched *s, const char *what, int rc)
@@ -422,12 +408,12 @@ static void sched_cp_error(struct nicogpu_sched *s)
 	u32 code, rptr, info, ibo;
 	int rc;
 
-	if (!rm_up(x))
+	if (!ng_rm_present(x))
 		return;
-	code = xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_ERROR);
-	rptr = xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_ERROR_RPTR);
-	info = xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_ERROR_INFO);
-	ibo = xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_ERROR_IB_OFFSET);
+	code = ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_ERROR);
+	rptr = ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_ERROR_RPTR);
+	info = ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_ERROR_INFO);
+	ibo = ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_ERROR_IB_OFFSET);
 	dev_err(&x->pdev->dev, "CP error %u (%s) at RPTR %u (opcode %02x vmid %u in_ib %u ib_offset %u)\n", code,
 		xdd_cp_error_name(code), rptr, info & NICOGPU_REG_CP_ERROR_INFO_OPCODE_MASK,
 		(info & NICOGPU_REG_CP_ERROR_INFO_VMID_MASK) >> 8, !!(info & NICOGPU_REG_CP_ERROR_INFO_IN_IB_MASK), ibo);
@@ -441,7 +427,7 @@ static void sched_try_io_recover(struct nicogpu_sched *s)
 {
 	int rc;
 
-	if (!READ_ONCE(s->core.io_err) || !rm_up(s->x) || time_before(jiffies, s->io_next))
+	if (!READ_ONCE(s->core.io_err) || !ng_rm_present(s->x) || time_before(jiffies, s->io_next))
 		return;
 	s->io_next = jiffies + HZ;
 	rc = xsc_recover_io(&s->core);
@@ -464,6 +450,14 @@ static void sched_do_reset_req(struct nicogpu_sched *s)
 	complete(&s->reset_done);
 }
 
+/* what both workers end with: retry a failed ring / doorbell access (io_err is sticky) and signal the dma_fences of the
+ * jobs retired meanwhile */
+static void sched_settle(struct nicogpu_sched *s)
+{
+	sched_try_io_recover(s);
+	nicogpu_fences_harvest(&s->fences, false);
+}
+
 static void sched_work(struct work_struct *w)
 {
 	struct nicogpu_sched *s = container_of(w, struct nicogpu_sched, work);
@@ -477,7 +471,7 @@ static void sched_work(struct work_struct *w)
 		sched_cp_error(s);
 	if (ev & XSC_IRQ_CP_FW) {
 		dev_info(&s->x->pdev->dev, "CP firmware status changed: %08x\n",
-			 xg_rd(s->x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_FW_STATUS));
+			 ng_rd(s->x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_FW_STATUS));
 		sched_log_recover(s, "CP firmware", xsc_cp_fw_event(&s->core));
 	}
 	if (ev & NICOGPU_EV_RESET_REQ)
@@ -485,8 +479,7 @@ static void sched_work(struct work_struct *w)
 	if (ev & NICOGPU_EV_RECOVER_IO)
 		s->io_next = jiffies;			/* a submit saw the failure: try now */
 	(void)xsc_run(&s->core);
-	sched_try_io_recover(s);			/* io_err is sticky: a failed ring / doorbell access, or a submit saw it */
-	nicogpu_fences_harvest(&s->fences, false);		/* jobs retired by the above: signal their dma_fences */
+	sched_settle(s);				/* io_err may be set by the above or by a submit; jobs retired by the above */
 	if (ev & NICOGPU_EV_DUMP)
 		nicogpu_dump(s->x, xsc_is_lost(&s->core) ? XDD_R_DEVICE_LOST : XDD_R_INCIDENT);
 	sched_arm_watchdog(s);
@@ -502,9 +495,7 @@ static void sched_timeout_work(struct work_struct *w)
 	rc = xsc_check_timeout(&s->core);
 	if (rc != XSC_RECOVER_NONE && rc != XSC_RECOVER_LOST_IRQ)
 		sched_log_recover(s, "job timeout", rc);
-	if (READ_ONCE(s->core.io_err))
-		sched_try_io_recover(s);
-	nicogpu_fences_harvest(&s->fences, false);
+	sched_settle(s);
 	if (rc >= XSC_RECOVER_LOST_IRQ)
 		queue_work(s->wq_run, &s->work);	/* freed ring space / replayed jobs */
 	sched_arm_watchdog(s);
@@ -655,9 +646,9 @@ void nicogpu_sched_fini(struct nicogpu_dev *x)
 	xsc_abort_all(&s->core, -EIO);			/* open files were torn down first: nothing should be left */
 	nicogpu_fences_harvest(&s->fences, true);		/* the aborted jobs' dma_fences signal with -ENODEV */
 	nicogpu_fences_fini(&s->fences);
-	if (rm_up(x)) {
-		xg_wr(x, NICOGPU_BAR_CTRL, NICOGPU_REG_IRQ_ENABLE, 0);
-		xg_wr(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_CTRL, NICOGPU_REG_CP_CTRL_CORE_RESET_MASK);
+	if (ng_rm_present(x)) {
+		ng_wr(x, NICOGPU_BAR_CTRL, NICOGPU_REG_IRQ_ENABLE, 0);
+		ng_wr(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_CTRL, NICOGPU_REG_CP_CTRL_CORE_RESET_MASK);
 	}
 	WARN_ON(xsc_fini(&s->core));
 	sched_free_page(s);
@@ -705,12 +696,14 @@ void nicogpu_sched_file_fini(struct nicogpu_file *xf)
 	xa_destroy(&xf->syncobjs);
 }
 
-/* xf->lock held */
+/* xf->lock held.  A queue QUEUE_DESTROY unlinked but is still draining counts: its jobs may still run in the VM. */
 bool nicogpu_sched_vm_in_use(struct nicogpu_file *xf, u32 vmid)
 {
 	struct nicogpu_queue *xq;
 	unsigned long idx;
 
+	if (vmid < NICOGPU_NUM_VMIDS && xf->vm_draining[vmid])
+		return true;
 	xa_for_each(&xf->queues, idx, xq)
 		if (xq->q->vmid == vmid)
 			return true;
@@ -724,28 +717,26 @@ static struct xsc_core *core_of(struct nicogpu_file *xf)
 	return &xf->x->sched.core;
 }
 
-long nicogpu_ioc_queue_create(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_queue_create(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_queue_create a;
+	struct nicogpu_queue_create *a = data;
 	struct nicogpu_queue *xq = NULL;
 	u32 id = 0;
 	long rc;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.flags || a.rsvd[0] || a.rsvd[1])
+	if (a->flags || a->rsvd[0] || a->rsvd[1])
 		return -EINVAL;
 	rc = sched_ensure(xf->x);
 	if (rc)
 		return rc;
 	mutex_lock(&xf->lock);
-	if (a.vm_id == 0 || a.vm_id >= NICOGPU_NUM_VMIDS || !xf->vms[a.vm_id])
+	if (a->vm_id == 0 || a->vm_id >= NICOGPU_NUM_VMIDS || !xf->vms[a->vm_id])
 		rc = -ENOENT;		/* HAL order: VM first ... */
-	else if (a.priority != NICOGPU_QUEUE_PRIORITY_NORMAL)
+	else if (a->priority != NICOGPU_QUEUE_PRIORITY_NORMAL)
 		rc = -EINVAL;		/* ... then priority */
 	else if (!(xq = kzalloc(sizeof(*xq), GFP_KERNEL_ACCOUNT)))
 		rc = -ENOMEM;
-	else if (!(xq->q = xsc_queue_alloc(core_of(xf), a.vm_id)) || !(xq->fctx = nicogpu_fctx_create()))
+	else if (!(xq->q = xsc_queue_alloc(core_of(xf), a->vm_id)) || !(xq->fctx = nicogpu_fctx_create()))
 		rc = -ENOMEM;
 	else
 		rc = xa_alloc(&xf->queues, &id, xq, XA_LIMIT(1, 0xffff), GFP_KERNEL_ACCOUNT);
@@ -762,65 +753,67 @@ long nicogpu_ioc_queue_create(struct nicogpu_file *xf, void *up)
 		}
 		return rc == -EBUSY ? -ENOSPC : rc;
 	}
-	a.queue_id = id;
-	return nicogpu_arg_out(up, &a, sizeof(a));	/* DRM copies the struct to user space after the handler */
+	a->queue_id = id;
+	return 0;
 }
 
-long nicogpu_ioc_queue_destroy(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_queue_destroy(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_queue_destroy a;
+	struct nicogpu_queue_destroy *a = data;
 	struct nicogpu_queue *xq;
+	u32 vmid = 0;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.pad)
+	if (a->pad)
 		return -EINVAL;
 	mutex_lock(&xf->lock);
-	xq = xa_erase(&xf->queues, a.queue_id);	/* no new submit can find it any more */
+	xq = xa_erase(&xf->queues, a->queue_id);	/* no new submit can find it any more */
+	if (xq) {
+		vmid = xq->q->vmid;
+		xf->vm_draining[vmid]++;		/* its VM stays in use until the jobs are gone */
+	}
 	mutex_unlock(&xf->lock);
 	if (!xq)
 		return -ENOENT;
 	queue_drain_free(xf->x, xq);
+	mutex_lock(&xf->lock);
+	xf->vm_draining[vmid]--;
+	mutex_unlock(&xf->lock);
 	return 0;
 }
 
-long nicogpu_ioc_queue_status(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_queue_status(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_queue_status a;
+	struct nicogpu_queue_status *a = data;
 	struct nicogpu_queue *xq;
 	long rc = 0;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.rsvd)
+	if (a->rsvd)
 		return -EINVAL;
 	mutex_lock(&xf->lock);
-	xq = xa_load(&xf->queues, a.queue_id);
+	xq = xa_load(&xf->queues, a->queue_id);
 	if (xq)
-		a.status = xsc_queue_guilty(core_of(xf), xq->q) ? NICOGPU_QUEUE_STATUS_GUILTY : NICOGPU_QUEUE_STATUS_OK;
+		a->status = xsc_queue_guilty(core_of(xf), xq->q) ? NICOGPU_QUEUE_STATUS_GUILTY : NICOGPU_QUEUE_STATUS_OK;
 	else
 		rc = -ENOENT;
 	mutex_unlock(&xf->lock);
 	if (rc)
 		return rc;
-	return nicogpu_arg_out(up, &a, sizeof(a)) ? -EFAULT : 0;
+	return 0;
 }
 
-long nicogpu_ioc_syncobj_create(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_syncobj_create(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_syncobj_create a;
+	struct nicogpu_syncobj_create *a = data;
 	struct xsc_syncobj *so;
 	u32 id;
 	long rc;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if ((a.flags & ~NICOGPU_SYNCOBJ_CREATE_SIGNALED) || a.rsvd)
+	if ((a->flags & ~NICOGPU_SYNCOBJ_CREATE_SIGNALED) || a->rsvd)
 		return -EINVAL;
 	rc = sched_ensure(xf->x);
 	if (rc)
 		return rc;
-	so = xsc_syncobj_alloc(core_of(xf), a.flags & NICOGPU_SYNCOBJ_CREATE_SIGNALED);
+	so = xsc_syncobj_alloc(core_of(xf), a->flags & NICOGPU_SYNCOBJ_CREATE_SIGNALED);
 	if (!so)
 		return -ENOMEM;
 	mutex_lock(&xf->lock);
@@ -830,21 +823,19 @@ long nicogpu_ioc_syncobj_create(struct nicogpu_file *xf, void *up)
 		xsc_syncobj_put(core_of(xf), so);
 		return rc == -EBUSY ? -ENOSPC : rc;
 	}
-	a.handle = id;
-	return nicogpu_arg_out(up, &a, sizeof(a));
+	a->handle = id;
+	return 0;
 }
 
-long nicogpu_ioc_syncobj_destroy(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_syncobj_destroy(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_syncobj_destroy a;
+	struct nicogpu_syncobj_destroy *a = data;
 	struct xsc_syncobj *so;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.pad)
+	if (a->pad)
 		return -EINVAL;
 	mutex_lock(&xf->lock);
-	so = xa_erase(&xf->syncobjs, a.handle);
+	so = xa_erase(&xf->syncobjs, a->handle);
 	mutex_unlock(&xf->lock);
 	if (!so)
 		return -ENOENT;
@@ -853,26 +844,24 @@ long nicogpu_ioc_syncobj_destroy(struct nicogpu_file *xf, void *up)
 }
 
 /* RESET and SIGNAL: same argument shape, all-or-nothing handle resolution */
-static long syncobj_array_op(struct nicogpu_file *xf, void *up, bool reset)
+static long syncobj_array_op(struct nicogpu_file *xf, void *data, bool reset)
 {
-	struct nicogpu_syncobj_array a;
+	struct nicogpu_syncobj_array *a = data;
 	struct xsc_syncobj *so[NICOGPU_SUBMIT_MAX_SYNCS];
 	u32 h[NICOGPU_SUBMIT_MAX_SYNCS];
 	long rc;
 	u32 i;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.flags || a.count > NICOGPU_SUBMIT_MAX_SYNCS)
+	if (a->flags || a->count > NICOGPU_SUBMIT_MAX_SYNCS)
 		return -EINVAL;
-	if (!a.count)
+	if (!a->count)
 		return 0;
-	if (copy_from_user(h, u64_to_user_ptr(a.handles), a.count * sizeof(h[0])))
+	if (copy_from_user(h, u64_to_user_ptr(a->handles), a->count * sizeof(h[0])))
 		return -EFAULT;
 	mutex_lock(&xf->lock);
-	for (i = 0; i < a.count; i++)
+	for (i = 0; i < a->count; i++)
 		so[i] = xa_load(&xf->syncobjs, h[i]);	/* NULL: unknown handle, the core says -ENOENT */
-	rc = reset ? xsc_syncobj_reset(core_of(xf), so, a.count) : xsc_syncobj_signal(core_of(xf), so, a.count);
+	rc = reset ? xsc_syncobj_reset(core_of(xf), so, a->count) : xsc_syncobj_signal(core_of(xf), so, a->count);
 	mutex_unlock(&xf->lock);
 	return rc;
 }
@@ -887,6 +876,19 @@ static long timeout_jiffies(s64 timeout_ns)
 	return nsecs_to_jiffies(timeout_ns) + 1;
 }
 
+/* Poll once with `call` (0, -ETIME or an error); while it says -ETIME and `left` jiffies were allowed, sleep on s->wq and
+ * poll again.  rc ends up 0 / an error / -ETIME (time ran out) / -ERESTARTSYS (signal). */
+#define sched_poll_wait(s, rc, left, call) \
+	do { \
+		(rc) = (call); \
+		if ((rc) == -ETIME && (left)) { \
+			long t_ = wait_event_interruptible_timeout((s)->wq, ((rc) = (call)) != -ETIME, (left)); \
+\
+			if (t_ < 0) \
+				(rc) = t_; \
+		} \
+	} while (0)
+
 /* WAIT_AVAILABLE (ABI v5) waits for "a fence is attached", the other modes for "the fence has signalled" */
 static int syncobj_poll(struct xsc_core *c, struct xsc_syncobj *const *so, u32 n, u32 flags, u32 *first)
 {
@@ -895,63 +897,60 @@ static int syncobj_poll(struct xsc_core *c, struct xsc_syncobj *const *so, u32 n
 	return xsc_syncobj_wait_poll(c, so, n, flags, first);
 }
 
-long nicogpu_ioc_syncobj_wait(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_syncobj_wait(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_syncobj_wait a;
+	struct nicogpu_syncobj_wait *a = data;
 	struct nicogpu_sched *s = &xf->x->sched;
 	struct xsc_syncobj *so[NICOGPU_SUBMIT_MAX_SYNCS];
 	u32 h[NICOGPU_SUBMIT_MAX_SYNCS];
 	u32 first = 0, i;
 	long rc, left;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.pad || a.rsvd || a.timeout_ns < 0 ||
-	    (a.flags & ~(NICOGPU_SYNCOBJ_WAIT_ALL | NICOGPU_SYNCOBJ_WAIT_FOR_SUBMIT | NICOGPU_SYNCOBJ_WAIT_AVAILABLE)) ||
-	    !a.count || a.count > NICOGPU_SUBMIT_MAX_SYNCS)
+	if (a->pad || a->rsvd || a->timeout_ns < 0 ||
+	    (a->flags & ~(NICOGPU_SYNCOBJ_WAIT_ALL | NICOGPU_SYNCOBJ_WAIT_FOR_SUBMIT | NICOGPU_SYNCOBJ_WAIT_AVAILABLE)) ||
+	    !a->count || a->count > NICOGPU_SUBMIT_MAX_SYNCS)
 		return -EINVAL;
-	if (copy_from_user(h, u64_to_user_ptr(a.handles), a.count * sizeof(h[0])))
+	if (copy_from_user(h, u64_to_user_ptr(a->handles), a->count * sizeof(h[0])))
 		return -EFAULT;
 	mutex_lock(&xf->lock);
-	for (i = 0; i < a.count; i++) {
+	for (i = 0; i < a->count; i++) {
 		so[i] = xa_load(&xf->syncobjs, h[i]);
 		if (so[i])
 			xsc_syncobj_get(&s->core, so[i]);	/* survive a concurrent SYNCOBJ_DESTROY */
 	}
 	mutex_unlock(&xf->lock);
 
-	left = timeout_jiffies(a.timeout_ns);
-	rc = syncobj_poll(&s->core, so, a.count, a.flags, &first);
-	if (rc == -ETIME && left) {
-		long t = wait_event_interruptible_timeout(s->wq,
-				(rc = syncobj_poll(&s->core, so, a.count, a.flags, &first)) != -ETIME, left);
-
-		if (t < 0)
-			rc = t;			/* -ERESTARTSYS */
-	}
-	for (i = 0; i < a.count; i++)
+	left = timeout_jiffies(a->timeout_ns);
+	sched_poll_wait(s, rc, left, syncobj_poll(&s->core, so, a->count, a->flags, &first));
+	for (i = 0; i < a->count; i++)
 		if (so[i])
 			xsc_syncobj_put(&s->core, so[i]);
 	if (rc)
 		return rc;
-	a.first_signaled = first;
-	return nicogpu_arg_out(up, &a, sizeof(a)) ? -EFAULT : 0;
+	a->first_signaled = first;
+	return 0;
 }
 
-/* Per sync entry state of a SUBMIT that names DRM core syncobjs (NICOGPU_SYNC_F_DRM). */
+/* Per sync entry state of a SUBMIT.  The core syncobj an entry resolves to lives in refs[i].so, the array xsc_submit()
+ * takes: for a DRM entry (NICOGPU_SYNC_F_DRM) a temporary one this submit owns (waits: it carries the dependency's
+ * core fence; signals: the placeholder the core arms), for a driver-private handle the handle's own (borrowed, looked
+ * up under xf->lock).  ent[] holds what only DRM signal entries need. */
 struct sub_ent {
-	struct xsc_syncobj *tmp;	/* waits: carries the dependency's core fence; signals: placeholder the core arms */
 	struct drm_syncobj *so;		/* signals: the DRM syncobj (reference) */
 	struct dma_fence_chain *chain;	/* signals with a timeline point: preallocated node */
 };
 
-static void sub_ents_free(struct nicogpu_sched *s, struct sub_ent *ent, u32 n)
+/* sync entries up to this many live on the stack (8 x 56 bytes); more come from one allocation */
+#define SUB_STACK_SYNCS		8
+
+static void sub_ents_free(struct nicogpu_sched *s, const struct nicogpu_sync *sy, struct xsc_sync_ref *refs,
+			  struct sub_ent *ent, u32 n)
 {
 	u32 i;
 
 	for (i = 0; i < n; i++) {
-		if (ent[i].tmp)
-			xsc_syncobj_put(&s->core, ent[i].tmp);
+		if ((sy[i].flags & NICOGPU_SYNC_F_DRM) && refs[i].so)
+			xsc_syncobj_put(&s->core, refs[i].so);	/* ours; a private handle's syncobj is only borrowed */
 		if (ent[i].so)
 			drm_syncobj_put(ent[i].so);
 		if (ent[i].chain)
@@ -963,7 +962,8 @@ static void sub_ents_free(struct nicogpu_sched *s, struct sub_ent *ent, u32 n)
  * Semantic failures (unknown handle, no fence yet) are not reported here: the entry becomes a NULL / fence-less core
  * syncobj and xsc_submit() reports -ENOENT / -EINVAL at the position HAL order puts them.  Only -ENOMEM and the like
  * abort early. */
-static long sub_resolve(struct nicogpu_file *xf, const struct nicogpu_sync *sy, struct sub_ent *ent, u32 nwaits, u32 nsync)
+static long sub_resolve(struct nicogpu_file *xf, const struct nicogpu_sync *sy, struct xsc_sync_ref *refs,
+			struct sub_ent *ent, u32 nwaits, u32 nsync)
 {
 	struct nicogpu_sched *s = &xf->x->sched;
 	u32 i, k;
@@ -976,28 +976,26 @@ static long sub_resolve(struct nicogpu_file *xf, const struct nicogpu_sync *sy, 
 			int rc = drm_syncobj_find_fence(xf->file, sy[i].handle, sy[i].point, 0, &f);
 
 			if (rc == -ENOENT) {
-				continue;		/* tmp == NULL: -ENOENT from the core */
+				continue;		/* so == NULL: -ENOENT from the core */
 			} else if (rc == -EINVAL) {	/* no fence (yet): -EINVAL from the core */
-				ent[i].tmp = xsc_syncobj_alloc(&s->core, false);
-				if (!ent[i].tmp)
+				refs[i].so = xsc_syncobj_alloc(&s->core, false);
+				if (!refs[i].so)
 					return -ENOMEM;
 			} else if (rc) {
 				return rc;
 			} else {
-				ent[i].tmp = nicogpu_fence_dep(&s->fences, f);
-				dma_fence_put(f);
-				if (IS_ERR(ent[i].tmp)) {
-					long e = PTR_ERR(ent[i].tmp);
+				struct xsc_syncobj *so = nicogpu_fence_dep(&s->fences, f);
 
-					ent[i].tmp = NULL;
-					return e;
-				}
+				dma_fence_put(f);
+				if (IS_ERR(so))
+					return PTR_ERR(so);
+				refs[i].so = so;
 			}
 		} else {
 			struct drm_syncobj *so = drm_syncobj_find(xf->file, sy[i].handle);
 
 			if (!so)
-				continue;		/* tmp == NULL: -ENOENT from the core */
+				continue;		/* so == NULL: -ENOENT from the core */
 			ent[i].so = so;
 			if (sy[i].point) {
 				ent[i].chain = dma_fence_chain_alloc();
@@ -1007,14 +1005,14 @@ static long sub_resolve(struct nicogpu_file *xf, const struct nicogpu_sync *sy, 
 			/* the same syncobj twice shares one placeholder, so the core's duplicate check sees it */
 			for (k = nwaits; k < i; k++) {
 				if (ent[k].so == so) {
-					xsc_syncobj_get(&s->core, ent[k].tmp);
-					ent[i].tmp = ent[k].tmp;
+					xsc_syncobj_get(&s->core, refs[k].so);
+					refs[i].so = refs[k].so;
 					break;
 				}
 			}
-			if (!ent[i].tmp) {
-				ent[i].tmp = xsc_syncobj_alloc(&s->core, false);
-				if (!ent[i].tmp)
+			if (!refs[i].so) {
+				refs[i].so = xsc_syncobj_alloc(&s->core, false);
+				if (!refs[i].so)
 					return -ENOMEM;
 			}
 		}
@@ -1022,71 +1020,84 @@ static long sub_resolve(struct nicogpu_file *xf, const struct nicogpu_sync *sy, 
 	return 0;
 }
 
-long nicogpu_ioc_submit(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_submit(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_submit a;
+	struct nicogpu_submit *a = data;
 	struct nicogpu_sched *s = &xf->x->sched;
+	struct nicogpu_sync sy_stack[SUB_STACK_SYNCS];
+	struct xsc_sync_ref refs_stack[SUB_STACK_SYNCS];
+	struct sub_ent ent_stack[SUB_STACK_SYNCS];
+	struct nicogpu_sync *sy = sy_stack;
+	struct xsc_sync_ref *refs = refs_stack;
+	struct sub_ent *ent = ent_stack;
+	void *blk = NULL;
 	struct xsc_job *job;
-	struct nicogpu_sync *sy = NULL;
-	struct xsc_sync_ref *refs = NULL;
-	struct sub_ent *ent = NULL;
 	struct nicogpu_queue *xq;
 	struct nicogpu_fence *fw = NULL;
 	u64 seq = 0;
 	u32 nsync, i;
 	long rc;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.flags || a.pad || a.rsvd[0] || a.rsvd[1] || a.num_cmdbufs > NICOGPU_SUBMIT_MAX_CMDBUFS ||
-	    a.num_waits > NICOGPU_SUBMIT_MAX_SYNCS || a.num_signals > NICOGPU_SUBMIT_MAX_SYNCS)
+	if (a->flags || a->pad || a->rsvd[0] || a->rsvd[1] || a->num_cmdbufs > NICOGPU_SUBMIT_MAX_CMDBUFS ||
+	    a->num_waits > NICOGPU_SUBMIT_MAX_SYNCS || a->num_signals > NICOGPU_SUBMIT_MAX_SYNCS)
 		return -EINVAL;
 	if (!READ_ONCE(s->ready))
 		return -ENOENT;		/* no queue can exist */
-	nsync = a.num_waits + a.num_signals;
-	job = xsc_job_alloc(&s->core, a.num_cmdbufs, a.num_waits);
+	nsync = a->num_waits + a->num_signals;
+	/* the job and its core fence are one allocation (xsc_job_alloc) */
+	job = xsc_job_alloc(&s->core, a->num_cmdbufs, a->num_waits);
 	if (!job)
 		return -ENOMEM;
-	if (a.num_cmdbufs &&
-	    copy_from_user(job->ib, u64_to_user_ptr(a.cmdbufs), a.num_cmdbufs * sizeof(struct nicogpu_cmdbuf))) {
+	if (nsync > SUB_STACK_SYNCS) {
+		/* one block: refs[] | ent[] | sy[] (refs and ent start zeroed, sy is copied in) */
+		blk = kzalloc(nsync * (sizeof(*refs) + sizeof(*ent) + sizeof(*sy)), GFP_KERNEL_ACCOUNT);
+		if (!blk) {
+			xsc_job_free(&s->core, job);
+			return -ENOMEM;
+		}
+		refs = blk;
+		ent = (struct sub_ent *)(refs + nsync);
+		sy = (struct nicogpu_sync *)(ent + nsync);
+	} else {
+		memset(refs_stack, 0, sizeof(refs_stack));
+		memset(ent_stack, 0, sizeof(ent_stack));
+	}
+	if (a->num_cmdbufs &&
+	    copy_from_user(job->ib, u64_to_user_ptr(a->cmdbufs), a->num_cmdbufs * sizeof(struct nicogpu_cmdbuf))) {
 		rc = -EFAULT;
+		nsync = 0;		/* nothing resolved yet: nothing to release */
 		goto err;
 	}
 	if (nsync) {
-		sy = kmalloc_array(nsync, sizeof(*sy), GFP_KERNEL_ACCOUNT);
-		refs = kmalloc_array(nsync, sizeof(*refs), GFP_KERNEL_ACCOUNT);
-		ent = kcalloc(nsync, sizeof(*ent), GFP_KERNEL_ACCOUNT);
-		if (!sy || !refs || !ent) {
-			rc = -ENOMEM;
-			goto err;
-		}
-		if ((a.num_waits &&
-		     copy_from_user(sy, u64_to_user_ptr(a.waits), a.num_waits * sizeof(*sy))) ||
-		    (a.num_signals &&
-		     copy_from_user(sy + a.num_waits, u64_to_user_ptr(a.signals), a.num_signals * sizeof(*sy)))) {
+		if ((a->num_waits &&
+		     copy_from_user(sy, u64_to_user_ptr(a->waits), a->num_waits * sizeof(*sy))) ||
+		    (a->num_signals &&
+		     copy_from_user(sy + a->num_waits, u64_to_user_ptr(a->signals), a->num_signals * sizeof(*sy)))) {
 			rc = -EFAULT;
+			nsync = 0;	/* sy[] may be partly garbage, nothing resolved yet: nothing to release */
 			goto err;
 		}
-		rc = sub_resolve(xf, sy, ent, a.num_waits, nsync);
+		rc = sub_resolve(xf, sy, refs, ent, a->num_waits, nsync);
 		if (rc)
 			goto err;
 	}
-	/* every job gets a dma_fence (the later dma_resv attach point); one kmalloc per job.  Pin the core fence
-	 * before the job is armed (it may retire at once).  Without a DRM signal entry nobody installs it: the pending list
-	 * holds the only reference until the harvester signals it. */
+	/* every job gets a dma_fence (the later dma_resv attach point); one kmalloc per job (a dma_fence is freed
+	 * through RCU on its own, it cannot share the job's block).  Pin the core fence before the job is armed (it may
+	 * retire at once).  Without a DRM signal entry nobody installs it: the pending list holds the only reference
+	 * until the harvester signals it. */
 	fw = nicogpu_fence_prepare(&s->fences, job->fence);
 	if (!fw) {
 		rc = -ENOMEM;
 		goto err;
 	}
 	mutex_lock(&xf->lock);
-	xq = xa_load(&xf->queues, a.queue_id);
+	xq = xa_load(&xf->queues, a->queue_id);
 	if (!xq) {
 		rc = -ENOENT;
 	} else {
 		for (i = 0; i < nsync; i++) {
 			if (sy[i].flags & NICOGPU_SYNC_F_DRM) {
-				refs[i].so = ent[i].tmp;	/* NULL: unknown handle */
+				/* refs[i].so: resolved above (NULL: unknown handle) */
 				refs[i].flags = sy[i].flags & ~NICOGPU_SYNC_F_DRM;	/* unknown bits: -EINVAL from the core */
 				refs[i].point = 0;
 			} else {
@@ -1095,7 +1106,7 @@ long nicogpu_ioc_submit(struct nicogpu_file *xf, void *up)
 				refs[i].point = sy[i].point;
 			}
 		}
-		rc = xsc_submit(&s->core, xq->q, job, refs, a.num_waits, refs + a.num_waits, a.num_signals, &seq);
+		rc = xsc_submit(&s->core, xq->q, job, refs, a->num_waits, refs + a->num_waits, a->num_signals, &seq);
 		if (!rc)
 			nicogpu_fence_arm(&s->fences, fw, xq->fctx);	/* per-queue seqno: serialised by xf->lock */
 	}
@@ -1108,7 +1119,7 @@ long nicogpu_ioc_submit(struct nicogpu_file *xf, void *up)
 		goto err;
 	}
 	/* The job is armed.  Publish its fence in the DRM syncobjs (neither call can fail; the chain node is consumed). */
-	for (i = a.num_waits; i < nsync; i++) {
+	for (i = a->num_waits; i < nsync; i++) {
 		if (!ent[i].so)
 			continue;
 		if (sy[i].point) {
@@ -1119,52 +1130,37 @@ long nicogpu_ioc_submit(struct nicogpu_file *xf, void *up)
 		}
 	}
 	dma_fence_put(&fw->base);	/* our reference; the syncobjs (if any) and the pending list hold theirs */
-	sub_ents_free(s, ent, nsync);
-	kfree(ent);
-	kfree(sy);
-	kfree(refs);
+	sub_ents_free(s, sy, refs, ent, nsync);
+	kfree(blk);
 	sched_kick(s);
-	a.fence_seq = seq;
-	/* the job is armed whatever happens to the copy-out */
-	return nicogpu_arg_out(up, &a, sizeof(a)) ? -EFAULT : 0;
+	a->fence_seq = seq;	/* the job is armed whatever happens to the copy-out */
+	return 0;
 err:
 	if (fw)
 		nicogpu_fence_discard(&s->fences, fw);
-	if (ent)
-		sub_ents_free(s, ent, nsync);
+	sub_ents_free(s, sy, refs, ent, nsync);
 	xsc_job_free(&s->core, job);
-	kfree(ent);
-	kfree(sy);
-	kfree(refs);
+	kfree(blk);
 	return rc;
 }
 
-long nicogpu_ioc_fence_wait(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_fence_wait(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_fence_wait a;
+	struct nicogpu_fence_wait *a = data;
 	struct nicogpu_sched *s = &xf->x->sched;
 	int err = 0;
 	long rc, left;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.flags || a.rsvd[0] || a.rsvd[1] || a.timeout_ns < 0)
+	if (a->flags || a->rsvd[0] || a->rsvd[1] || a->timeout_ns < 0)
 		return -EINVAL;
 	if (!READ_ONCE(s->ready))
 		return -EINVAL;		/* nothing was ever submitted */
-	left = timeout_jiffies(a.timeout_ns);
-	rc = xsc_seq_status(&s->core, a.seq, &err);
-	if (rc == -ETIME && left) {
-		long t = wait_event_interruptible_timeout(s->wq,
-				(rc = xsc_seq_status(&s->core, a.seq, &err)) != -ETIME, left);
-
-		if (t < 0)
-			rc = t;
-	}
+	left = timeout_jiffies(a->timeout_ns);
+	sched_poll_wait(s, rc, left, xsc_seq_status(&s->core, a->seq, &err));
 	if (rc)
 		return rc;
-	a.status = err;
-	return nicogpu_arg_out(up, &a, sizeof(a)) ? -EFAULT : 0;
+	a->status = err;
+	return 0;
 }
 
 /* ---- device status (ABI v5) ------------------------------------------------- */
@@ -1216,13 +1212,14 @@ long nicogpu_ioc_dev_status(struct nicogpu_file *xf, void *data)
 	a.lost_count = x->lost.count;
 	spin_unlock_irqrestore(&x->lost.lock, flags);
 	a.now_ns = ktime_get_ns();
-	return nicogpu_arg_out(data, &a, sizeof(a));
+	*(struct nicogpu_dev_status *)data = a;
+	return 0;
 }
 
-/* What a GUILTY queue knows about why (VMID, VA, access type, level, entry). */
-long nicogpu_ioc_queue_fault(struct nicogpu_file *xf, void *up)
+/* What a GUILTY queue knows about why. */
+long nicogpu_ioc_queue_fault(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_queue_fault a;
+	struct nicogpu_queue_fault *a = data;
 	struct nicogpu_sched *s = &xf->x->sched;
 	struct xsc_queue_fault qf = { };
 	struct nicogpu_queue *xq;
@@ -1231,12 +1228,10 @@ long nicogpu_ioc_queue_fault(struct nicogpu_file *xf, void *up)
 	u32 resets = 0, gpu_resets = 0;
 	bool lost = false;
 
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.rsvd[0] || a.rsvd[1])
+	if (a->rsvd[0] || a->rsvd[1])
 		return -EINVAL;
 	mutex_lock(&xf->lock);
-	xq = xa_load(&xf->queues, a.queue_id);
+	xq = xa_load(&xf->queues, a->queue_id);
 	if (!xq) {
 		rc = -ENOENT;
 	} else {
@@ -1250,51 +1245,48 @@ long nicogpu_ioc_queue_fault(struct nicogpu_file *xf, void *up)
 	mutex_unlock(&xf->lock);
 	if (rc)
 		return rc;
-	a.status = guilty ? NICOGPU_QUEUE_STATUS_GUILTY : NICOGPU_QUEUE_STATUS_OK;
-	a.cause = qf.cause;			/* XSC_CAUSE_* and NICOGPU_FAULT_CAUSE_* are the same numbers */
-	a.cp_error = qf.cp_error;
-	a.err = qf.err;
-	a.fence_seq = qf.seq;
-	a.flags = lost ? NICOGPU_FAULT_F_DEVICE_LOST : 0;
+	a->status = guilty ? NICOGPU_QUEUE_STATUS_GUILTY : NICOGPU_QUEUE_STATUS_OK;
+	a->cause = qf.cause;			/* XSC_CAUSE_* and NICOGPU_FAULT_CAUSE_* are the same numbers */
+	a->cp_error = qf.cp_error;
+	a->err = qf.err;
+	a->fence_seq = qf.seq;
+	a->flags = lost ? NICOGPU_FAULT_F_DEVICE_LOST : 0;
 	if (guilty && qf.has_mmu) {
-		a.flags |= NICOGPU_FAULT_F_MMU_VALID | (qf.mmu.multi ? NICOGPU_FAULT_F_MMU_MULTI : 0);
-		a.mmu_code = qf.mmu.code;
-		a.mmu_access = qf.mmu.access;
-		a.mmu_level = qf.mmu.level;
-		a.mmu_vmid = qf.mmu.vmid;
-		a.mmu_va = qf.mmu.va;
-		a.mmu_pte = qf.mmu.pte;
+		a->flags |= NICOGPU_FAULT_F_MMU_VALID | (qf.mmu.multi ? NICOGPU_FAULT_F_MMU_MULTI : 0);
+		a->mmu_code = qf.mmu.code;
+		a->mmu_access = qf.mmu.access;
+		a->mmu_level = qf.mmu.level;
+		a->mmu_vmid = qf.mmu.vmid;
+		a->mmu_va = qf.mmu.va;
+		a->mmu_pte = qf.mmu.pte;
 	}
-	a.resets = resets;
-	a.gpu_resets = gpu_resets;
-	return nicogpu_arg_out(up, &a, sizeof(a)) ? -EFAULT : 0;
+	a->resets = resets;
+	a->gpu_resets = gpu_resets;
+	return 0;
 }
 
-long nicogpu_ioc_reset(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_reset(struct nicogpu_file *xf, void *data)
 {
-	struct nicogpu_reset a;
+	struct nicogpu_reset *a = data;
 	long rc;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
-	if (nicogpu_arg_in(&a, up, sizeof(a)))
-		return -EFAULT;
-	if (a.flags || a.result || a.pad || a.rsvd[0] || a.rsvd[1] || a.level < NICOGPU_RESET_CP || a.level > NICOGPU_RESET_GPU)
+	if (a->flags || a->result || a->pad || a->rsvd[0] || a->rsvd[1] || a->level < NICOGPU_RESET_CP || a->level > NICOGPU_RESET_GPU)
 		return -EINVAL;
-	rc = nicogpu_sched_reset(xf->x, a.level);
-	a.result = rc;
-	nicogpu_arg_out(up, &a, sizeof(a));
+	rc = nicogpu_sched_reset(xf->x, a->level);
+	a->result = rc;
 	return 0;			/* the outcome of the reset itself is in `result` */
 }
 
-long nicogpu_ioc_syncobj_reset(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_syncobj_reset(struct nicogpu_file *xf, void *data)
 {
-	return syncobj_array_op(xf, up, true);
+	return syncobj_array_op(xf, data, true);
 }
 
-long nicogpu_ioc_syncobj_signal(struct nicogpu_file *xf, void *up)
+long nicogpu_ioc_syncobj_signal(struct nicogpu_file *xf, void *data)
 {
-	return syncobj_array_op(xf, up, false);
+	return syncobj_array_op(xf, data, false);
 }
 
 /* ---- manual reset, PR hook, devcoredump ------------------------------------------- */
@@ -1324,28 +1316,12 @@ int nicogpu_sched_reset(struct nicogpu_dev *x, u32 level)
 	return rc;
 }
 
-/* PR step 2: the scheduler and the CP stop; the next queue / syncobj ioctl brings them up again. */
-void nicogpu_sched_stop(struct nicogpu_dev *x)
-{
-	nicogpu_sched_fini(x);
-}
-
-static u32 dump_shell_rd(void *ctx, u32 off)
-{
-	return xg_rd(ctx, NICOGPU_BAR_SHELL, off);
-}
-
-static u32 dump_rm_rd(void *ctx, u32 off)
-{
-	return xg_rd(ctx, NICOGPU_BAR_CTRL, off);
-}
-
-/* One devcoredump (text, PROVISIONAL).  Process context.
+/* One devcoredump.  Process context.
  * dev_coredumpv() keeps one dump per device until it is read or times out; a second one is dropped by the core. */
 void nicogpu_dump(struct nicogpu_dev *x, enum xdd_reason reason)
 {
 	struct nicogpu_sched *s = &x->sched;
-	struct xdd_io io = { .ctx = x, .shell_rd = dump_shell_rd, .rm_rd = dump_rm_rd };
+	struct xdd_io io = { .ctx = x, .shell_rd = ng_op_shell_rd, .rm_rd = ng_op_rm_rd };
 	struct xsc_snap *snap = NULL;
 	struct xdd_regs *regs = NULL;
 	struct xdd_input *in = NULL;
@@ -1369,8 +1345,8 @@ void nicogpu_dump(struct nicogpu_dev *x, enum xdd_reason reason)
 	xdd_collect_regs(&io, regs);
 	in->regs = regs;
 	if (regs->rm_visible) {
-		in->fw_version = xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_FW_VERSION);
-		in->cmd_version = xg_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_CMD_VERSION);
+		in->fw_version = ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_FW_VERSION);
+		in->cmd_version = ng_rd(x, NICOGPU_BAR_CTRL, NICOGPU_REG_CP_CMD_VERSION);
 	}
 	nicogpu_dfx_fill_dump(x, &in->dfx);
 	n = xdd_format(buf, NICOGPU_DUMP_BYTES, in);
